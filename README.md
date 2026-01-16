@@ -2,6 +2,12 @@
 
 A Python library for working with time series of gamma ray spectra and listmode data.
 
+## Note on Similar Projects
+
+This project (`gammaflow`) should not be confused with [GAMMA_FLOW](https://github.com/ElsevierSoftwareX/SOFTX-D-25-00403), which is a separate tool developed by a different team (no affiliation with us) that is focused on isotope classification via matrix factorization (published in Elsevier SoftwareX). 
+
+**GammaFlow** provides comprehensive data structures and time-series analysis infrastructure for gamma-ray spectroscopy (similar to pandas/numpy for radiation detection), while **GAMMA_FLOW** is a classification-focused application for multi-label spectral analysis. Both projects serve different needs in the gamma spectroscopy community.
+
 ## Features
 
 ### Core Classes
