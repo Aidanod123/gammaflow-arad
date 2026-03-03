@@ -50,7 +50,29 @@ This project (`gammaflow`) should not be confused with [GAMMA_FLOW](https://gith
   - Track creation method (manual, peak search, censored windows, etc.)
   - Time series analysis with ROIs
 
-### Algorithms
+### Detection Algorithms
+
+All detectors inherit from `BaseDetector`, which provides a shared interface for
+training, threshold calibration (via false-alarm rate), time-series processing,
+and alarm aggregation. Detected anomalies are returned as `AlarmEvent` objects.
+
+- **SADDetector** (Spectral Anomaly Detection)
+  - PCA-based reconstruction error
+  - Learns a low-dimensional subspace from background spectra
+  - Anomaly score: squared residual after projection
+  - Optional per-spectrum normalization
+
+- **ARADDetector** (Autoencoder Reconstruction Anomaly Detection, requires PyTorch)
+  - 1-D convolutional autoencoder trained on background spectra
+  - Scoring via Jensen-Shannon Divergence or Chi-squared reconstruction error
+  - Configurable architecture (latent dim, dropout, kernel sizes)
+  - GPU-accelerated training and inference
+
+- **KSigmaDetector**
+  - Streaming detector with online background estimation
+  - No offline training required; background statistics update incrementally
+  - Background is frozen during alarm periods
+  - Threshold expressed as number of standard deviations
 
 - **Censored Energy Window (CEW)**
   - Gradient-based optimization for optimal energy window selection
@@ -59,6 +81,22 @@ This project (`gammaflow`) should not be confused with [GAMMA_FLOW](https://gith
   - Score spectra for anomaly detection or source presence
   - Convert optimized windows to EnergyROI objects
   - Serializable predictors for deployment
+
+### Datasets
+
+Built-in loaders for standard gamma-ray spectroscopy benchmark datasets.
+
+- **TopCoderDataset** -- TopCoder Urban Radiation Search challenge
+  - Loads list-mode CSV data and answer keys
+  - Splits: `training`, `testing`, `leaderboard`
+  - Returns `SpectralTimeSeries` via configurable energy binning and integration time
+
+- **APLStarterKitDataset** -- APL Starter Kit dataset (AIPT/DRAG)
+  - Loads pre-binned `.open` spectral files
+  - Multi-detector support (selectable gamma element index)
+  - Splits: `background`, `source`
+  - Filtering by `is-active` and `is-in-zone` flags
+  - Returns `SpectralTimeSeries` with per-sample metadata
 
 ### Visualization
 
@@ -401,22 +439,25 @@ gammaflow/
 ├── gammaflow/
 │   ├── __init__.py
 │   ├── core/
-│   │   ├── __init__.py
 │   │   ├── calibration.py
 │   │   ├── spectrum.py
 │   │   ├── spectra.py
 │   │   ├── time_series.py
 │   │   └── listmode.py
 │   ├── operations/
-│   │   ├── __init__.py
 │   │   ├── energy.py
 │   │   ├── temporal.py
 │   │   └── roi.py
 │   ├── algorithms/
-│   │   ├── __init__.py
+│   │   ├── base.py              # BaseDetector, AlarmEvent
+│   │   ├── sad.py               # SADDetector (PCA)
+│   │   ├── arad.py              # ARADDetector (autoencoder, requires PyTorch)
+│   │   ├── k_sigma.py           # KSigmaDetector (streaming)
 │   │   └── censored_energy_window.py
+│   ├── datasets/
+│   │   ├── topcoder.py          # TopCoder Urban Radiation Search
+│   │   └── apl_starter_kit.py   # APL Starter Kit (AIPT/DRAG)
 │   ├── utils/
-│   │   ├── __init__.py
 │   │   └── exceptions.py
 │   └── visualization/
 │       └── __init__.py
@@ -427,29 +468,38 @@ gammaflow/
 
 ## Examples
 
-See the `examples/` directory for comprehensive examples:
-- `basic_usage.py` - Spectrum and time series basics
-- `advanced_usage.py` - Advanced operations and workflows
-- `list_mode_example.py` - Working with list mode data
-- `listmode_class_example.py` - ListMode class usage
-- `reintegrate_example.py` - Time resolution reintegration
-- `timing_inference_example.py` - Automatic timing detection
-- `roi_example.py` - Energy ROI analysis
-- `cew_example.py` - Censored Energy Window algorithm usage
-- `visualization_example.py` - Plotting spectra and time series
+See the `examples/` directory. Jupyter notebooks demonstrate end-to-end
+detection workflows on real datasets; Python scripts cover core API usage.
+
+### Detection Notebooks
+
+- `sad_detection.ipynb` -- SAD detection on the TopCoder dataset
+- `arad_detection.ipynb` -- ARAD detection on the TopCoder dataset
+- `k_sigma_detection.ipynb` -- K-Sigma detection on the TopCoder dataset (full-spectrum and ROI-based)
+- `sad_detection_apl_starter_kit.ipynb` -- SAD detection on the APL Starter Kit dataset
+
+### Core API Scripts
+
+- `basic_usage.py` -- Spectrum and time series basics
+- `advanced_usage.py` -- Advanced operations and workflows
+- `list_mode_example.py` -- Working with list mode data
+- `listmode_class_example.py` -- ListMode class usage
+- `reintegrate_example.py` -- Time resolution reintegration
+- `timing_inference_example.py` -- Automatic timing detection
+- `roi_example.py` -- Energy ROI analysis
+- `visualization_example.py` -- Plotting spectra and time series
 
 ## Documentation
 
-Documentation is integrated into docstrings throughout the codebase. Key concepts are explained in the README above. For detailed API documentation, use Python's built-in help:
+Documentation is integrated into docstrings throughout the codebase. For detailed API documentation, use Python's built-in help:
 
 ```python
 from gammaflow import Spectrum, Spectra, SpectralTimeSeries
-from gammaflow.algorithms import CEWPredictor
+from gammaflow.algorithms import SADDetector, KSigmaDetector, BaseDetector
+from gammaflow.datasets import TopCoderDataset, APLStarterKitDataset
 
-help(Spectrum)
-help(Spectra)
-help(SpectralTimeSeries)
-help(CEWPredictor)
+help(SADDetector)
+help(TopCoderDataset)
 ```
 
 ## Key Concepts
@@ -500,7 +550,8 @@ Test coverage includes:
 - Core functionality (Spectrum, Spectra, SpectralTimeSeries, ListMode)
 - Energy operations (rebinning, calibration, ROIs)
 - Time series operations (reintegration, slicing, filtering)
-- Censored Energy Window algorithm
+- Detection algorithms (SAD, ARAD, K-Sigma, CEW)
+- Dataset loaders (TopCoder, APL Starter Kit)
 - Shared calibration and copy-on-write behavior
 - NumPy interoperability
 

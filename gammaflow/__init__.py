@@ -13,9 +13,10 @@ from gammaflow.utils.exceptions import (
     IncompatibleBinningError,
 )
 
-# Make operations and algorithms easily accessible
+# Make subpackages easily accessible
 from gammaflow import operations
 from gammaflow import algorithms
+from gammaflow import datasets
 
 __version__ = "0.1.0"
 __all__ = [
@@ -29,5 +30,6 @@ __all__ = [
     "IncompatibleBinningError",
     "operations",
     "algorithms",
+    "datasets",
 ]
 

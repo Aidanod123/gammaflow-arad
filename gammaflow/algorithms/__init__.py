@@ -1,16 +1,41 @@
 """
 Algorithms for advanced spectral analysis.
 
-This module provides implementations of advanced algorithms for gamma-ray
-spectroscopy.
+This module provides implementations of detection algorithms for gamma-ray
+spectroscopy, built on a common ``BaseDetector`` interface.
 
-Note: Some advanced algorithms (like CEW) may be available in development
+Detection algorithms:
+- ``ARADDetector`` — autoencoder reconstruction anomaly detection
+- ``SADDetector``  — PCA-based spectral anomaly detection
+- ``KSigmaDetector`` — rolling background k-sigma detection
+
+Base classes:
+- ``BaseDetector`` — abstract base for all detection algorithms
+- ``AlarmEvent``   — dataclass representing a detected anomaly event
+
+Note: Some algorithms (like CEW) may be available in development
 versions but not included in the released package.
 """
 
-__all__ = []
+from gammaflow.algorithms.base import AlarmEvent, BaseDetector
+from gammaflow.algorithms.sad import SADDetector
+from gammaflow.algorithms.k_sigma import KSigmaDetector
 
-# Try to import CEW if available (may not be present in released versions)
+__all__ = [
+    "AlarmEvent",
+    "BaseDetector",
+    "SADDetector",
+    "KSigmaDetector",
+]
+
+# ARAD requires PyTorch — import conditionally
+try:
+    from gammaflow.algorithms.arad import ARADDetector
+    __all__.append("ARADDetector")
+except ImportError:
+    pass
+
+# CEW may not be present in released versions
 try:
     from gammaflow.algorithms.censored_energy_window import (
         optimize_cew_windows,
@@ -18,11 +43,9 @@ try:
         CEWPredictor,
     )
     __all__.extend([
-        'optimize_cew_windows',
-        'fit_cew_predictor',
-        'CEWPredictor',
+        "optimize_cew_windows",
+        "fit_cew_predictor",
+        "CEWPredictor",
     ])
 except ImportError:
-    # CEW not available in this version
     pass
-
