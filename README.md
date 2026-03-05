@@ -477,6 +477,7 @@ detection workflows on real datasets; Python scripts cover core API usage.
 - `arad_detection.ipynb` -- ARAD detection on the TopCoder dataset
 - `k_sigma_detection.ipynb` -- K-Sigma detection on the TopCoder dataset (full-spectrum and ROI-based)
 - `sad_detection_apl_starter_kit.ipynb` -- SAD detection on the APL Starter Kit dataset
+- `arad_cross_dataset.ipynb` -- ARAD trained on TopCoder, tested on APL Starter Kit
 
 ### Core API Scripts
 
