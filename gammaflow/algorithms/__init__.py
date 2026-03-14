@@ -35,6 +35,13 @@ try:
 except ImportError:
     pass
 
+# Temporal LSTM detector requires PyTorch — import conditionally
+try:
+    from gammaflow.algorithms.lstm_temporal import LSTMTemporalDetector
+    __all__.append("LSTMTemporalDetector")
+except ImportError:
+    pass
+
 # CEW may not be present in released versions
 try:
     from gammaflow.algorithms.censored_energy_window import (
