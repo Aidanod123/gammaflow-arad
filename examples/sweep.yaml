@@ -1,0 +1,79 @@
+# W&B Sweep configuration for LSTMTemporalDetector hyperparameter search.
+#
+# 1. Register the sweep (run once from repo root):
+#      wandb sweep examples/sweep.yaml
+#    This prints a sweep ID like: aodonnell/gammaflow-lstm/abc12345
+#
+# 2. Launch one or more agents (each agent runs trials until stopped):
+#      wandb agent aodonnell/gammaflow-lstm/abc12345
+#    Run this command in multiple shells / on multiple machines to parallelize.
+#
+# 3. Monitor progress at https://wandb.ai
+
+program: examples/sweep_train.py
+method: bayes          # bayes | random | grid
+metric:
+  name: val/loss
+  goal: minimize
+
+# Kill trials that are clearly worse than the current best.
+# min_iter=5 gives the ReduceLROnPlateau scheduler (patience=2) time to fire
+# at least once before we judge the trial.
+early_terminate:
+  type: hyperband
+  min_iter: 5
+  eta: 2              # halving rate: keep top 1/eta of trials each round
+  s: 2                # number of bracket rungs
+
+# Safety cap: stop the sweep after this many trials (omit to run indefinitely).
+run_cap: 60
+
+parameters:
+  # --- fixed across sweep (set values here or override in sweep_train.py) ---
+  preprocessed_dir:
+    value: preprocessed-data/no-sources-.5-0.1
+  epochs:
+    value: 20
+  batch_size:
+    value: 128
+  val_fraction:
+    value: 0.2
+  seed:
+    value: 42
+  grad_clip_norm:
+    value: 1.0
+
+  # --- swept hyperparameters ---
+
+  # NOTE: 'mse' is intentionally excluded. LSTMTemporalDetector only supports
+  # 'jsd' and 'chi2' as scoring (and training) loss types.
+  loss_type:
+    values: [jsd, chi2]
+
+  seq_len:
+    values: [10, 20, 40]
+
+  latent_dim:
+    values: [32, 64, 128]
+
+  lstm_hidden_dim:
+    values: [64, 128, 256]
+
+  lstm_layers:
+    values: [1, 2]
+
+  # NOTE: TemporalLSTMAutoencoder only applies LSTM inter-layer dropout, which
+  # PyTorch forces to 0 when lstm_layers=1. sweep_train.py handles this by
+  # setting effective_dropout=0.0 when lstm_layers=1 and logging it explicitly.
+  dropout:
+    values: [0.0, 0.1, 0.2, 0.3]
+
+  learning_rate:
+    distribution: log_uniform_values
+    min: 1.0e-4
+    max: 1.0e-2
+
+  weight_decay:
+    distribution: log_uniform_values
+    min: 1.0e-6
+    max: 1.0e-3

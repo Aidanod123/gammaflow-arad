@@ -1,0 +1,228 @@
+"""Train LSTMTemporalDetector from preprocessed RADAI run tensors.
+
+Example:
+    python examples/train_lstm_temporal_preprocessed.py \
+      --preprocessed-dir preprocessed-data/no-sources-.5-0.1 \
+      --output-model artifacts/lstm_temporal_no_sources_0p5_0p1.pt \
+      --epochs 25 --batch-size 256 --seq-len 20 --seq-stride 1
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+# Ensure local repo package is importable when running this script directly.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from gammaflow.training import train_lstm_temporal_from_preprocessed
+
+
+def _maybe_import_wandb(enabled: bool):
+    if not enabled:
+        return None
+    try:
+        import wandb  # type: ignore
+
+        return wandb
+    except ImportError as exc:
+        raise ImportError(
+            "W&B was requested but is not installed. Install with: pip install wandb"
+        ) from exc
+
+
+def _build_wandb_config(args: argparse.Namespace) -> Dict[str, Any]:
+    return {
+        "preprocessed_dir": args.preprocessed_dir,
+        "output_model": args.output_model,
+        "seq_len": args.seq_len,
+        "seq_stride": args.seq_stride,
+        "latent_dim": args.latent_dim,
+        "lstm_hidden_dim": args.lstm_hidden_dim,
+        "lstm_layers": args.lstm_layers,
+        "dropout": args.dropout,
+        "loss_type": args.loss_type,
+        "learning_rate": args.learning_rate,
+        "weight_decay": args.weight_decay,
+        "batch_size": args.batch_size,
+        "epochs": args.epochs,
+        "val_fraction": args.val_fraction,
+        "seed": args.seed,
+        "num_workers": args.num_workers,
+        "grad_clip_norm": args.grad_clip_norm,
+        "cache_size": args.cache_size,
+        "device": args.device,
+        "require_cuda": args.require_cuda,
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Train LSTMTemporalDetector from preprocessed run tensors"
+    )
+    parser.add_argument(
+        "--preprocessed-dir",
+        type=str,
+        required=True,
+        help="Directory containing run*.pt and preprocess_stats.json",
+    )
+    parser.add_argument(
+        "--output-model",
+        type=str,
+        required=True,
+        help="Path to save trained detector checkpoint (.pt)",
+    )
+    parser.add_argument("--seq-len", type=int, default=20)
+    parser.add_argument("--seq-stride", type=int, default=1)
+    parser.add_argument("--latent-dim", type=int, default=64)
+    parser.add_argument("--lstm-hidden-dim", type=int, default=128)
+    parser.add_argument("--lstm-layers", type=int, default=1)
+    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--loss-type", type=str, default="jsd", choices=["mse", "jsd", "chi2"])
+    parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-5)
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--val-fraction", type=float, default=0.2)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--grad-clip-norm", type=float, default=1.0)
+    parser.add_argument("--cache-size", type=int, default=2)
+    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument(
+        "--require-cuda",
+        action="store_true",
+        help="Fail if CUDA is unavailable instead of falling back to CPU",
+    )
+    parser.add_argument("--quiet", action="store_true", help="Disable per-epoch logging")
+    parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
+    parser.add_argument("--wandb-project", type=str, default="gammaflow-lstm")
+    parser.add_argument("--wandb-entity", type=str, default=None)
+    parser.add_argument("--wandb-run-name", type=str, default=None)
+    parser.add_argument(
+        "--wandb-tags",
+        type=str,
+        default="",
+        help="Comma-separated W&B tags (example: lstm,preprocessed,jsd)",
+    )
+    parser.add_argument("--wandb-group", type=str, default=None)
+    parser.add_argument(
+        "--wandb-mode",
+        type=str,
+        choices=["online", "offline", "disabled"],
+        default="online",
+        help="W&B mode. Use offline for air-gapped runs.",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    wandb = _maybe_import_wandb(args.wandb)
+    wb_run = None
+    epoch_logger = None
+
+    if wandb is not None:
+        tags = [t.strip() for t in args.wandb_tags.split(",") if t.strip()]
+        wb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=args.wandb_run_name,
+            group=args.wandb_group,
+            tags=tags,
+            mode=args.wandb_mode,
+            job_type="train",
+            config=_build_wandb_config(args),
+        )
+
+        def _log_epoch(metrics: Dict[str, float]) -> None:
+            wandb.log(
+                {
+                    "epoch": int(metrics["epoch"]),
+                    "train/loss": float(metrics["train_loss"]),
+                    "val/loss": float(metrics["val_loss"]),
+                    "train/lr": float(metrics["lr"]),
+                    "train/best_val_loss": float(metrics["best_val_loss"]),
+                },
+                step=int(metrics["epoch"]),
+            )
+
+        epoch_logger = _log_epoch
+
+    result = train_lstm_temporal_from_preprocessed(
+        preprocessed_dir=args.preprocessed_dir,
+        output_model_path=args.output_model,
+        seq_len=args.seq_len,
+        seq_stride=args.seq_stride,
+        latent_dim=args.latent_dim,
+        lstm_hidden_dim=args.lstm_hidden_dim,
+        lstm_layers=args.lstm_layers,
+        dropout=args.dropout,
+        loss_type=args.loss_type,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+        batch_size=args.batch_size,
+        epochs=args.epochs,
+        val_fraction=args.val_fraction,
+        seed=args.seed,
+        num_workers=args.num_workers,
+        grad_clip_norm=args.grad_clip_norm,
+        cache_size=args.cache_size,
+        device=args.device,
+        require_cuda=args.require_cuda,
+        verbose=not args.quiet,
+        epoch_end_callback=epoch_logger,
+    )
+
+    if wb_run is not None:
+        wandb.summary["best_val_loss"] = float(result["best_val_loss"])
+        wandb.summary["model_path"] = str(result["model_path"])
+        wandb.summary["metrics_path"] = str(result["metrics_path"])
+
+        model_artifact = wandb.Artifact(
+            name=f"lstm-temporal-{Path(result['model_path']).stem}",
+            type="model",
+            metadata={
+                "best_val_loss": float(result["best_val_loss"]),
+                "loss_type": args.loss_type,
+                "seq_len": args.seq_len,
+                "seq_stride": args.seq_stride,
+            },
+        )
+        model_artifact.add_file(str(result["model_path"]))
+        model_artifact.add_file(str(result["metrics_path"]))
+        wandb.log_artifact(model_artifact)
+
+        with open(result["metrics_path"], "r", encoding="utf-8") as f:
+            metrics_payload: Dict[str, Any] = json.load(f)
+        history = metrics_payload.get("history", {})
+        if history:
+            history_table = wandb.Table(
+                columns=["epoch", "train_loss", "val_loss", "lr"]
+            )
+            n_epochs = len(history.get("train_loss", []))
+            for idx in range(n_epochs):
+                history_table.add_data(
+                    idx + 1,
+                    float(history.get("train_loss", [])[idx]),
+                    float(history.get("val_loss", [])[idx]),
+                    float(history.get("lr", [])[idx]),
+                )
+            wandb.log({"train/history": history_table})
+
+        wandb.finish()
+
+    print("Training complete")
+    print(f"Model:   {result['model_path']}")
+    print(f"Metrics: {result['metrics_path']}")
+    print(f"Best val loss: {result['best_val_loss']:.6f}")
+
+
+if __name__ == "__main__":
+    main()

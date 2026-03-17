@@ -376,8 +376,34 @@ class BaseDetector(ABC):
             )
 
         scores = self.score_time_series(background_data)
+        finite_scores = scores[np.isfinite(scores)]
+        if finite_scores.size == 0:
+            raise ValueError(
+                "No finite scores available for threshold calibration. "
+                "Check model outputs and warmup handling."
+            )
 
-        total_time_seconds = float(np.sum(background_data.real_times))
+        # Prefer timestamp-based elapsed duration to avoid overcounting when
+        # windows overlap (stride < integration).
+        times = self._extract_timestamps(background_data)
+        total_time_seconds = 0.0
+        if len(times) > 1 and np.all(np.isfinite(times)):
+            dt = np.diff(times)
+            dt = dt[np.isfinite(dt) & (dt > 0)]
+
+            window_width = None
+            integration_time = getattr(background_data, "integration_time", None)
+            if integration_time is not None and np.isfinite(integration_time):
+                window_width = float(integration_time)
+            elif dt.size > 0:
+                window_width = float(np.median(dt))
+
+            if window_width is not None:
+                total_time_seconds = float(times[-1] - times[0] + max(window_width, 0.0))
+
+        if total_time_seconds <= 0:
+            total_time_seconds = float(np.sum(background_data.real_times))
+
         total_time_hours = total_time_seconds / 3600.0
 
         if total_time_hours <= 0:
@@ -385,13 +411,13 @@ class BaseDetector(ABC):
                 f"Invalid observation time: {total_time_hours} hours"
             )
 
-        low_threshold = float(np.min(scores))
-        high_threshold = float(np.max(scores)) * 1.5
+        low_threshold = float(np.min(finite_scores))
+        high_threshold = float(np.max(finite_scores)) * 1.5
 
         best_threshold = float(
             np.percentile(
-                scores,
-                max(0.1, min(99.9, 100 * (1 - alarms_per_hour / (60 * len(scores))))),
+                finite_scores,
+                max(0.1, min(99.9, 100 * (1 - alarms_per_hour / (60 * len(finite_scores))))),
             )
         )
         best_far_diff = float("inf")
@@ -400,9 +426,9 @@ class BaseDetector(ABC):
         if verbose:
             print(
                 f"Calibrating threshold for {alarms_per_hour:.2f} alarms/hour...\n"
-                f"  Background: {len(scores)} spectra over {total_time_hours:.2f} hours\n"
-                f"  Score range: [{scores.min():.4f}, {scores.max():.4f}]\n"
-                f"  Score mean +/- std: {scores.mean():.4f} +/- {scores.std():.4f}"
+                f"  Background: {len(finite_scores)} finite scores (of {len(scores)}) over {total_time_hours:.2f} hours\n"
+                f"  Score range: [{finite_scores.min():.4f}, {finite_scores.max():.4f}]\n"
+                f"  Score mean +/- std: {finite_scores.mean():.4f} +/- {finite_scores.std():.4f}"
             )
 
         for iteration in range(max_iterations):

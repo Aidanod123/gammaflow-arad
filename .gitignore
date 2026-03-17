@@ -92,3 +92,11 @@ gammaflow/algorithms/censored_energy_window.py
 examples/cew_example.py
 tests/test_cew.py
 CEW_CONTIGUOUS_WINDOWS_FIX.md
+
+#Dataset
+/RADAI
+/preprocessed-data
+
+/models
+/wandb
+/eval-results
