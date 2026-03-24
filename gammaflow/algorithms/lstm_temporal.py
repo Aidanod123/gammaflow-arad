@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 import warnings
 
 import numpy as np
@@ -33,6 +33,7 @@ except ImportError:
     )
 
 from gammaflow.algorithms.base import BaseDetector
+from gammaflow.algorithms.arad import ARADEncoderBlock, ARADDecoderBlock
 
 
 @dataclass
@@ -75,10 +76,23 @@ class TemporalLSTMAutoencoder(nn.Module):
         self.lstm_layers = int(lstm_layers)
         self.dropout = float(dropout)
 
+        if self.n_bins % 32 != 0:
+            raise ValueError(
+                f"n_bins ({self.n_bins}) must be divisible by 32 for ARAD CNN blocks"
+            )
+
+        self._downsampled_bins = self.n_bins // 32
+
         self.encoder = nn.Sequential(
-            nn.Linear(self.n_bins, self.latent_dim),
+            ARADEncoderBlock(1, 8, 7, self.dropout),
+            ARADEncoderBlock(8, 8, 5, self.dropout),
+            ARADEncoderBlock(8, 8, 3, self.dropout),
+            ARADEncoderBlock(8, 8, 3, self.dropout),
+            ARADEncoderBlock(8, 8, 3, self.dropout),
+            nn.Flatten(),
+            nn.Linear(8 * self._downsampled_bins, self.latent_dim),
             nn.Mish(),
-            nn.LayerNorm(self.latent_dim),
+            nn.BatchNorm1d(self.latent_dim),
         )
 
         lstm_dropout = self.dropout if self.lstm_layers > 1 else 0.0
@@ -90,29 +104,86 @@ class TemporalLSTMAutoencoder(nn.Module):
             dropout=lstm_dropout,
         )
 
-        self.decoder = nn.Sequential(
+        self.temporal_to_latent = nn.Sequential(
             nn.Linear(self.lstm_hidden_dim, self.latent_dim),
             nn.Mish(),
-            nn.LayerNorm(self.latent_dim),
-            nn.Linear(self.latent_dim, self.n_bins),
-            nn.Softplus(),
+            nn.BatchNorm1d(self.latent_dim),
+        )
+
+        self.decoder_linear = nn.Sequential(
+            nn.Linear(self.latent_dim, 8 * self._downsampled_bins),
+            nn.Mish(),
+            nn.BatchNorm1d(8 * self._downsampled_bins),
+        )
+
+        self.decoder = nn.Sequential(
+            ARADDecoderBlock(8, 8, 3, self.dropout),
+            ARADDecoderBlock(8, 8, 3, self.dropout),
+            ARADDecoderBlock(8, 8, 3, self.dropout),
+            ARADDecoderBlock(8, 8, 5, self.dropout),
+            ARADDecoderBlock(8, 1, 7, self.dropout, is_output=True),
         )
 
         self.apply(self._init_weights)
 
     @staticmethod
     def _init_weights(module: nn.Module) -> None:
-        if isinstance(module, nn.Linear):
+        if isinstance(module, (nn.Conv1d, nn.ConvTranspose1d)):
+            nn.init.kaiming_normal_(module.weight, mode="fan_in", nonlinearity="linear")
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0.01)
+        elif isinstance(module, nn.Linear):
             nn.init.xavier_uniform_(module.weight)
             if module.bias is not None:
-                nn.init.constant_(module.bias, 0.0)
+                nn.init.constant_(module.bias, 0.01)
 
-    def forward(self, windows: torch.Tensor) -> torch.Tensor:
-        """Forward pass from sequence window to final-step reconstruction."""
-        encoded = self.encoder(windows)
+    def _normalize_input(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalize spectra by per-sample max and add channel dimension."""
+        eps = 1e-8
+        max_val = torch.max(x, dim=1, keepdim=True).values
+        normalized_x = x / (max_val + eps)
+        return normalized_x.unsqueeze(1)
+
+    def forward(
+        self,
+        windows: torch.Tensor,
+        latent_timestep_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Forward pass from sequence window to final-step reconstruction.
+
+        Parameters
+        ----------
+        windows : torch.Tensor
+            Tensor of shape ``(batch, seq_len, n_bins)``.
+        latent_timestep_mask : torch.Tensor, optional
+            Boolean mask of shape ``(batch, seq_len)`` (or ``(seq_len,)``).
+            True entries zero-out the corresponding latent timestep after the
+            encoder and before the temporal LSTM.
+        """
+        batch_size, seq_len, _ = windows.shape
+        flat_windows = windows.reshape(batch_size * seq_len, self.n_bins)
+        normalized_windows = self._normalize_input(flat_windows)
+        encoded_flat = self.encoder(normalized_windows)
+        encoded = encoded_flat.view(batch_size, seq_len, self.latent_dim)
+
+        if latent_timestep_mask is not None:
+            if latent_timestep_mask.ndim == 1:
+                latent_timestep_mask = latent_timestep_mask.unsqueeze(0)
+            if latent_timestep_mask.shape != encoded.shape[:2]:
+                raise ValueError(
+                    "latent_timestep_mask must have shape "
+                    f"(batch, seq_len)={tuple(encoded.shape[:2])}, "
+                    f"got {tuple(latent_timestep_mask.shape)}"
+                )
+            mask = latent_timestep_mask.to(device=encoded.device, dtype=torch.bool)
+            encoded = encoded.masked_fill(mask.unsqueeze(-1), 0.0)
+
         temporal_out, _ = self.temporal_core(encoded)
         final_embedding = temporal_out[:, -1, :]
-        reconstructed_last = self.decoder(final_embedding)
+        decoder_latent = self.temporal_to_latent(final_embedding)
+        decoded_linear = self.decoder_linear(decoder_latent)
+        decoded_linear = decoded_linear.view(batch_size, 8, self._downsampled_bins)
+        reconstructed_last = self.decoder(decoded_linear).view(batch_size, self.n_bins)
         return reconstructed_last
 
 
@@ -300,8 +371,10 @@ class LSTMTemporalDetector(BaseDetector):
 
     def _chi2_score(self, target: torch.Tensor, recon: torch.Tensor) -> torch.Tensor:
         eps = 1e-8
-        recon = torch.clamp(recon, min=eps)
-        return torch.sum((target - recon) ** 2 / recon, dim=-1)
+        max_vals = torch.max(target, dim=1, keepdim=True).values
+        recon_denorm = recon * (max_vals + eps)
+        recon_denorm = torch.clamp(recon_denorm, min=eps)
+        return torch.sum((target - recon_denorm) ** 2 / recon_denorm, dim=-1)
 
     def _score_batch(self, targets: torch.Tensor, recon: torch.Tensor) -> torch.Tensor:
         if self.loss_type == "jsd":
@@ -325,18 +398,83 @@ class LSTMTemporalDetector(BaseDetector):
             return None
         return counts[indices]
 
-    def score_time_series(self, time_series) -> np.ndarray:
+    def _build_latent_mask_for_window(
+        self,
+        window_indices: np.ndarray,
+        masked_index_set: Optional[Set[int]],
+        latent_mask_pct: float,
+        rng: Optional[np.random.Generator],
+    ) -> Optional[np.ndarray]:
+        mask = np.zeros(self.seq_len, dtype=bool)
+        history_len = self.seq_len - 1
+
+        if history_len <= 0:
+            return None
+
+        if masked_index_set:
+            mask[:history_len] = np.isin(
+                window_indices[:history_len],
+                np.fromiter(masked_index_set, dtype=int),
+            )
+
+        if latent_mask_pct > 0.0 and rng is not None:
+            random_mask = rng.random(history_len) < float(latent_mask_pct)
+            mask[:history_len] = np.logical_or(mask[:history_len], random_mask)
+
+        return mask if bool(mask.any()) else None
+
+    def score_time_series(
+        self,
+        time_series,
+        mask_indices: Optional[Sequence[int]] = None,
+        latent_mask_pct: float = 0.0,
+        mask_seed: Optional[int] = None,
+        mask_alarm_feedback: bool = False,
+        feedback_threshold: Optional[float] = None,
+    ) -> np.ndarray:
         """
         Score time series with causal rolling windows.
 
         Returns one score per input spectrum. Entries without enough history
         are ``np.nan``.
+
+        Parameters
+        ----------
+        mask_indices : sequence of int, optional
+            Absolute time-series indices whose latent history timestep should be
+            masked (set to zero embedding) when they appear in a causal window.
+        latent_mask_pct : float
+            Additional random masking percentage applied per history timestep.
+            Must be in ``[0, 1]``.
+        mask_seed : int, optional
+            Seed used for random masking reproducibility.
+        mask_alarm_feedback : bool
+            If True, any timestep whose score exceeds ``feedback_threshold`` is
+            added to the latent mask set for subsequent windows. This supports
+            deployment behavior where prior alarmed spectra are not fed back as
+            normal history into the LSTM context.
+        feedback_threshold : float, optional
+            Threshold used for alarm-feedback masking. When ``None``, uses
+            ``self.threshold``.
         """
         if not self.is_trained:
             raise RuntimeError(
                 "Detector must be trained or loaded before scoring. "
                 "Call fit(..., trainer_fn=...) or load(path)."
             )
+
+        if not (0.0 <= float(latent_mask_pct) <= 1.0):
+            raise ValueError(f"latent_mask_pct must be in [0, 1], got {latent_mask_pct}")
+
+        if mask_alarm_feedback:
+            threshold_for_feedback = self.threshold if feedback_threshold is None else float(feedback_threshold)
+            if threshold_for_feedback is None:
+                raise RuntimeError(
+                    "mask_alarm_feedback=True requires a threshold. "
+                    "Set detector.threshold or pass feedback_threshold."
+                )
+        else:
+            threshold_for_feedback = None
 
         counts = np.asarray(time_series.counts, dtype=np.float32)
         if counts.ndim != 2:
@@ -347,6 +485,11 @@ class LSTMTemporalDetector(BaseDetector):
             )
 
         metrics = np.full(counts.shape[0], np.nan, dtype=float)
+        rng = np.random.default_rng(mask_seed) if float(latent_mask_pct) > 0.0 else None
+        masked_index_set: Optional[Set[int]] = None
+        if mask_indices is not None:
+            masked_index_set = {int(i) for i in mask_indices if int(i) >= 0}
+        dynamic_masked_index_set: Set[int] = set(masked_index_set or set())
 
         self.model_.eval()
         with torch.no_grad():
@@ -355,15 +498,50 @@ class LSTMTemporalDetector(BaseDetector):
                 if window is None:
                     continue
 
+                window_indices = self._window_indices_for_end(i)
+                latent_mask_np = self._build_latent_mask_for_window(
+                    window_indices=window_indices,
+                    masked_index_set=dynamic_masked_index_set,
+                    latent_mask_pct=float(latent_mask_pct),
+                    rng=rng,
+                )
+
                 window_tensor = torch.from_numpy(window).unsqueeze(0).to(self.device)
                 target_tensor = torch.from_numpy(counts[i]).unsqueeze(0).to(self.device)
-                reconstruction = self.model_(window_tensor)
+                latent_mask_tensor = None
+                if latent_mask_np is not None:
+                    latent_mask_tensor = (
+                        torch.from_numpy(latent_mask_np)
+                        .unsqueeze(0)
+                        .to(self.device)
+                    )
+
+                reconstruction = self.model_(
+                    window_tensor,
+                    latent_timestep_mask=latent_mask_tensor,
+                )
                 score = self._score_batch(target_tensor, reconstruction)
                 metrics[i] = float(score.item())
 
+                # Feed alarmed timesteps back as masked history for future windows.
+                if (
+                    mask_alarm_feedback
+                    and threshold_for_feedback is not None
+                    and np.isfinite(metrics[i])
+                    and metrics[i] > threshold_for_feedback
+                ):
+                    dynamic_masked_index_set.add(int(i))
+
         return metrics
 
-    def process_time_series(self, time_series) -> np.ndarray:
+    def process_time_series(
+        self,
+        time_series,
+        mask_indices: Optional[Sequence[int]] = None,
+        latent_mask_pct: float = 0.0,
+        mask_seed: Optional[int] = None,
+        mask_alarm_feedback: bool = False,
+    ) -> np.ndarray:
         """
         Process a time series and aggregate alarms from temporal scores.
 
@@ -381,7 +559,14 @@ class LSTMTemporalDetector(BaseDetector):
             )
 
         self.reset_alarms()
-        scores = self.score_time_series(time_series)
+        scores = self.score_time_series(
+            time_series,
+            mask_indices=mask_indices,
+            latent_mask_pct=latent_mask_pct,
+            mask_seed=mask_seed,
+            mask_alarm_feedback=mask_alarm_feedback,
+            feedback_threshold=self.threshold,
+        )
         times = self._extract_timestamps(time_series)
 
         for score, t in zip(scores, times):
@@ -401,6 +586,153 @@ class LSTMTemporalDetector(BaseDetector):
             self._end_alarm(float(times[-1]))
 
         return scores
+
+    def set_threshold_by_far(
+        self,
+        background_data,
+        alarms_per_hour: float = 1.0,
+        max_iterations: int = 20,
+        verbose: bool = False,
+        mask_indices: Optional[Sequence[int]] = None,
+        latent_mask_pct: float = 0.0,
+        mask_seed: Optional[int] = None,
+        mask_alarm_feedback: bool = False,
+    ) -> float:
+        """Set threshold to achieve target FAR with optional latent masking."""
+        if not self.is_trained:
+            raise RuntimeError("Detector must be trained before setting threshold.")
+
+        # During calibration bootstrap, threshold may be unset. Alarm-feedback
+        # masking requires a threshold, so bootstrap score stats without feedback
+        # and then enable it inside the threshold search loop.
+        bootstrap_feedback = bool(mask_alarm_feedback and self.threshold is not None)
+        scores = self.score_time_series(
+            background_data,
+            mask_indices=mask_indices,
+            latent_mask_pct=latent_mask_pct,
+            mask_seed=mask_seed,
+            mask_alarm_feedback=bootstrap_feedback,
+            feedback_threshold=self.threshold if bootstrap_feedback else None,
+        )
+        finite_scores = scores[np.isfinite(scores)]
+        if finite_scores.size == 0:
+            raise ValueError(
+                "No finite scores available for threshold calibration. "
+                "Check model outputs and warmup handling."
+            )
+
+        times = self._extract_timestamps(background_data)
+        total_time_seconds = 0.0
+        if len(times) > 1 and np.all(np.isfinite(times)):
+            dt = np.diff(times)
+            dt = dt[np.isfinite(dt) & (dt > 0)]
+
+            window_width = None
+            integration_time = getattr(background_data, "integration_time", None)
+            if integration_time is not None and np.isfinite(integration_time):
+                window_width = float(integration_time)
+            elif dt.size > 0:
+                window_width = float(np.median(dt))
+
+            if window_width is not None:
+                total_time_seconds = float(times[-1] - times[0] + max(window_width, 0.0))
+
+        if total_time_seconds <= 0:
+            total_time_seconds = float(np.sum(background_data.real_times))
+
+        total_time_hours = total_time_seconds / 3600.0
+        if total_time_hours <= 0:
+            raise ValueError(f"Invalid observation time: {total_time_hours} hours")
+
+        low_threshold = float(np.min(finite_scores))
+        high_threshold = float(np.max(finite_scores)) * 1.5
+
+        best_threshold = float(
+            np.percentile(
+                finite_scores,
+                max(0.1, min(99.9, 100 * (1 - alarms_per_hour / (60 * len(finite_scores))))),
+            )
+        )
+        best_far_diff = float("inf")
+        best_observed_far = 0.0
+
+        if verbose:
+            print(
+                f"Calibrating threshold for {alarms_per_hour:.2f} alarms/hour...\n"
+                f"  Background: {len(finite_scores)} finite scores (of {len(scores)}) over {total_time_hours:.2f} hours\n"
+                f"  Score range: [{finite_scores.min():.4f}, {finite_scores.max():.4f}]\n"
+                f"  Score mean +/- std: {finite_scores.mean():.4f} +/- {finite_scores.std():.4f}"
+            )
+
+        for iteration in range(max_iterations):
+            test_threshold = (low_threshold + high_threshold) / 2
+            self.threshold = test_threshold
+
+            self.process_time_series(
+                background_data,
+                mask_indices=mask_indices,
+                latent_mask_pct=latent_mask_pct,
+                mask_seed=mask_seed,
+                mask_alarm_feedback=mask_alarm_feedback,
+            )
+            n_alarms = len(self.alarms)
+            observed_far = n_alarms / total_time_hours
+
+            far_diff = abs(observed_far - alarms_per_hour)
+
+            is_better = False
+            if far_diff < best_far_diff:
+                is_better = True
+            elif far_diff == best_far_diff:
+                if observed_far > best_observed_far:
+                    is_better = True
+                elif observed_far == best_observed_far:
+                    is_better = test_threshold < best_threshold
+
+            if is_better:
+                best_far_diff = far_diff
+                best_threshold = test_threshold
+                best_observed_far = observed_far
+
+            if verbose:
+                print(
+                    f"  Iter {iteration + 1}: threshold={test_threshold:.6f} "
+                    f"-> {n_alarms} alarms ({observed_far:.2f}/hr)"
+                )
+
+            if observed_far > alarms_per_hour:
+                low_threshold = test_threshold
+            else:
+                high_threshold = test_threshold
+
+            if (
+                far_diff < 0.1 * alarms_per_hour
+                or (high_threshold - low_threshold) < 1e-8
+            ):
+                if verbose:
+                    print(f"  Converged after {iteration + 1} iterations")
+                break
+
+        self.threshold = best_threshold
+
+        self.process_time_series(
+            background_data,
+            mask_indices=mask_indices,
+            latent_mask_pct=latent_mask_pct,
+            mask_seed=mask_seed,
+            mask_alarm_feedback=mask_alarm_feedback,
+        )
+        final_far = len(self.alarms) / total_time_hours
+
+        if verbose:
+            print(
+                f"\n  Threshold set: {self.threshold:.6f}\n"
+                f"  Achieved FAR: {final_far:.2f} alarms/hour "
+                f"({len(self.alarms)} alarms)\n"
+                f"  Target FAR: {alarms_per_hour:.2f} alarms/hour"
+            )
+
+        return self.threshold
 
     def save(self, path: str) -> None:
         """Save model weights and detector config."""

@@ -55,6 +55,8 @@ def _build_wandb_config(args: argparse.Namespace) -> Dict[str, Any]:
         "seed": args.seed,
         "num_workers": args.num_workers,
         "grad_clip_norm": args.grad_clip_norm,
+        "latent_mask_pct": args.latent_mask_pct,
+        "latent_mask_seed": args.latent_mask_seed,
         "cache_size": args.cache_size,
         "device": args.device,
         "require_cuda": args.require_cuda,
@@ -92,6 +94,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
+    parser.add_argument(
+        "--latent-mask-pct",
+        type=float,
+        default=0.0,
+        help="Post-encoder latent history timestep masking percentage in [0, 1]",
+    )
+    parser.add_argument(
+        "--latent-mask-seed",
+        type=int,
+        default=None,
+        help="Optional random seed for latent timestep masking",
+    )
     parser.add_argument("--cache-size", type=int, default=2)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument(
@@ -173,6 +187,8 @@ def main() -> None:
         seed=args.seed,
         num_workers=args.num_workers,
         grad_clip_norm=args.grad_clip_norm,
+        latent_mask_pct=args.latent_mask_pct,
+        latent_mask_seed=args.latent_mask_seed,
         cache_size=args.cache_size,
         device=args.device,
         require_cuda=args.require_cuda,
@@ -193,6 +209,7 @@ def main() -> None:
                 "loss_type": args.loss_type,
                 "seq_len": args.seq_len,
                 "seq_stride": args.seq_stride,
+                "latent_mask_pct": args.latent_mask_pct,
             },
         )
         model_artifact.add_file(str(result["model_path"]))

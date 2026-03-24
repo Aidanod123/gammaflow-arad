@@ -273,8 +273,10 @@ def _jsd_loss(target: torch.Tensor, recon: torch.Tensor) -> torch.Tensor:
 
 def _chi2_loss(target: torch.Tensor, recon: torch.Tensor) -> torch.Tensor:
     eps = 1e-8
-    recon = torch.clamp(recon, min=eps)
-    return torch.mean(torch.sum((target - recon) ** 2 / recon, dim=-1))
+    max_vals = torch.max(target, dim=1, keepdim=True).values
+    recon_denorm = recon * (max_vals + eps)
+    recon_denorm = torch.clamp(recon_denorm, min=eps)
+    return torch.mean(torch.sum((target - recon_denorm) ** 2 / recon_denorm, dim=-1))
 
 
 def _get_loss_fn(loss_name: str):
@@ -288,6 +290,23 @@ def _get_loss_fn(loss_name: str):
     raise ValueError(f"Unsupported loss '{loss_name}'. Use one of: mse, jsd, chi2")
 
 
+def _sample_history_latent_mask(
+    batch_size: int,
+    seq_len: int,
+    latent_mask_pct: float,
+    rng: np.random.Generator,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """Sample a boolean mask over latent timesteps, excluding final timestep."""
+    if latent_mask_pct <= 0.0 or seq_len <= 1:
+        return None
+
+    history_mask = rng.random((batch_size, seq_len - 1)) < float(latent_mask_pct)
+    final_col = np.zeros((batch_size, 1), dtype=bool)
+    full_mask = np.concatenate([history_mask, final_col], axis=1)
+    return torch.from_numpy(full_mask).to(device=device)
+
+
 def train_lstm_temporal_from_preprocessed(
     preprocessed_dir: str,
     output_model_path: str,
@@ -295,7 +314,7 @@ def train_lstm_temporal_from_preprocessed(
     seq_stride: int = 1,
     latent_dim: int = 64,
     lstm_hidden_dim: int = 128,
-    lstm_layers: int = 1,
+    lstm_layers: int = 2,
     dropout: float = 0.2,
     loss_type: str = "jsd",
     learning_rate: float = 1e-3,
@@ -306,6 +325,8 @@ def train_lstm_temporal_from_preprocessed(
     seed: int = 42,
     num_workers: int = 0,
     grad_clip_norm: float = 1.0,
+    latent_mask_pct: float = 0.0,
+    latent_mask_seed: Optional[int] = None,
     cache_size: int = 2,
     device: Optional[str] = None,
     require_cuda: bool = False,
@@ -318,6 +339,9 @@ def train_lstm_temporal_from_preprocessed(
     """
     torch.manual_seed(seed)
     np.random.seed(seed)
+
+    if not (0.0 <= float(latent_mask_pct) <= 1.0):
+        raise ValueError(f"latent_mask_pct must be in [0, 1], got {latent_mask_pct}")
 
     bundles = build_dataloaders_from_preprocessed(
         preprocessed_dir=preprocessed_dir,
@@ -366,6 +390,8 @@ def train_lstm_temporal_from_preprocessed(
         print(f"Training on GPU: {gpu_name} ({detector.device})")
 
     model = detector.model_
+    mask_rng_seed = seed if latent_mask_seed is None else int(latent_mask_seed)
+    mask_rng = np.random.default_rng(mask_rng_seed)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -398,9 +424,16 @@ def train_lstm_temporal_from_preprocessed(
         for windows, targets in bundles.train_loader:
             windows = windows.to(detector.device)
             targets = targets.to(detector.device)
+            latent_mask = _sample_history_latent_mask(
+                batch_size=int(windows.shape[0]),
+                seq_len=int(windows.shape[1]),
+                latent_mask_pct=float(latent_mask_pct),
+                rng=mask_rng,
+                device=detector.device,
+            )
 
             optimizer.zero_grad(set_to_none=True)
-            recon = model(windows)
+            recon = model(windows, latent_timestep_mask=latent_mask)
             loss = loss_fn(targets, recon)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
@@ -419,7 +452,14 @@ def train_lstm_temporal_from_preprocessed(
             for windows, targets in bundles.val_loader:
                 windows = windows.to(detector.device)
                 targets = targets.to(detector.device)
-                recon = model(windows)
+                latent_mask = _sample_history_latent_mask(
+                    batch_size=int(windows.shape[0]),
+                    seq_len=int(windows.shape[1]),
+                    latent_mask_pct=float(latent_mask_pct),
+                    rng=mask_rng,
+                    device=detector.device,
+                )
+                recon = model(windows, latent_timestep_mask=latent_mask)
                 loss = loss_fn(targets, recon)
                 batch_size_actual = int(windows.shape[0])
                 val_loss_sum += float(loss.item()) * batch_size_actual
@@ -478,6 +518,8 @@ def train_lstm_temporal_from_preprocessed(
         "epochs": epochs,
         "val_fraction": val_fraction,
         "seed": seed,
+        "latent_mask_pct": latent_mask_pct,
+        "latent_mask_seed": latent_mask_seed,
         "device": str(detector.device),
         "require_cuda": require_cuda,
         "n_bins": bundles.n_bins,

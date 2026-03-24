@@ -156,6 +156,32 @@ def parse_args() -> argparse.Namespace:
         help="Override time units when reading dt from H5 (default: infer from run payload)",
     )
     parser.add_argument(
+        "--latent-mask-pct",
+        type=float,
+        default=0.0,
+        help="Random post-encoder latent history mask percentage in [0, 1]",
+    )
+    parser.add_argument(
+        "--latent-mask-seed",
+        type=int,
+        default=None,
+        help="Optional random seed for latent masking",
+    )
+    parser.add_argument(
+        "--latent-mask-file",
+        type=str,
+        default=None,
+        help="Optional JSON map of run identifiers to explicit masked spectrum indices",
+    )
+    parser.add_argument(
+        "--mask-alarm-feedback",
+        action="store_true",
+        help=(
+            "Mask spectra that crossed threshold as latent history in subsequent "
+            "windows (alarm-feedback masking)."
+        ),
+    )
+    parser.add_argument(
         "--max-runs",
         type=int,
         default=None,
@@ -582,6 +608,42 @@ def _to_builtin(value):
     return value
 
 
+def _load_explicit_mask_map(mask_file: Optional[Path]) -> Dict[str, List[int]]:
+    if mask_file is None:
+        return {}
+
+    with mask_file.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    if not isinstance(payload, dict):
+        raise ValueError("latent mask file must be a JSON object mapping run ids to index lists")
+
+    out: Dict[str, List[int]] = {}
+    for key, value in payload.items():
+        if not isinstance(value, list):
+            raise ValueError(f"Mask indices for key '{key}' must be a list")
+        out[str(key)] = [int(v) for v in value if int(v) >= 0]
+    return out
+
+
+def _resolve_run_mask_indices(
+    explicit_mask_map: Dict[str, List[int]],
+    run: RunData,
+) -> Optional[List[int]]:
+    if not explicit_mask_map:
+        return None
+
+    candidates = [run.run_name, Path(run.run_name).stem]
+    if run.run_id is not None:
+        candidates.extend([str(run.run_id), f"run{run.run_id}"])
+
+    for key in candidates:
+        if key in explicit_mask_map:
+            return sorted(set(int(i) for i in explicit_mask_map[key] if int(i) >= 0))
+
+    return None
+
+
 def _flatten_dict(prefix: str, payload: Dict[str, Any], out: Dict[str, Any]) -> None:
     for key, value in payload.items():
         full_key = f"{prefix}/{key}" if prefix else str(key)
@@ -601,6 +663,10 @@ def _build_eval_wandb_config(args: argparse.Namespace) -> Dict[str, Any]:
         "h5_path": args.h5_path,
         "time_units": args.time_units,
         "max_runs": args.max_runs,
+        "latent_mask_pct": args.latent_mask_pct,
+        "latent_mask_seed": args.latent_mask_seed,
+        "latent_mask_file": args.latent_mask_file,
+        "mask_alarm_feedback": args.mask_alarm_feedback,
     }
 
 
@@ -639,6 +705,10 @@ def evaluate_model(
     h5_path: Optional[Path],
     time_units_override: Optional[str],
     quiet: bool,
+    latent_mask_pct: float,
+    latent_mask_seed: Optional[int],
+    explicit_mask_map: Dict[str, List[int]],
+    mask_alarm_feedback: bool,
 ) -> Dict[str, object]:
     detector = LSTMTemporalDetector(verbose=not quiet)
     detector.load(str(model_path))
@@ -650,7 +720,18 @@ def evaluate_model(
 
     for run in eval_runs:
         ts = run.time_series
-        scores = detector.process_time_series(ts)
+        run_mask_indices = _resolve_run_mask_indices(explicit_mask_map, run)
+        run_mask_seed = latent_mask_seed
+        if run_mask_seed is not None and run.run_id is not None:
+            run_mask_seed = int(run_mask_seed) + int(run.run_id)
+
+        scores = detector.process_time_series(
+            ts,
+            mask_indices=run_mask_indices,
+            latent_mask_pct=float(latent_mask_pct),
+            mask_seed=run_mask_seed,
+            mask_alarm_feedback=bool(mask_alarm_feedback),
+        )
         alarms = detector.get_alarm_summary().get("alarm_events", [])
 
         finite_scores = scores[np.isfinite(scores)]
@@ -667,6 +748,12 @@ def evaluate_model(
             "threshold": float(detector.threshold),
             "threshold_crossings": threshold_crossings,
             "alarm_summary": detector.get_alarm_summary(),
+            "latent_masking": {
+                "latent_mask_pct": float(latent_mask_pct),
+                "latent_mask_seed": run_mask_seed,
+                "explicit_mask_count": int(len(run_mask_indices or [])),
+                "mask_alarm_feedback": bool(mask_alarm_feedback),
+            },
         }
 
         # Optional weak labels from H5 source event IDs.
@@ -737,7 +824,16 @@ def evaluate_model(
 
     all_scores = np.concatenate(
         [
-            detector.score_time_series(r.time_series)
+            detector.score_time_series(
+                r.time_series,
+                mask_indices=_resolve_run_mask_indices(explicit_mask_map, r),
+                latent_mask_pct=float(latent_mask_pct),
+                mask_seed=(int(latent_mask_seed) + int(r.run_id))
+                if (latent_mask_seed is not None and r.run_id is not None)
+                else latent_mask_seed,
+                mask_alarm_feedback=bool(mask_alarm_feedback),
+                feedback_threshold=float(detector.threshold),
+            )
             for r in eval_runs
         ]
     )
@@ -748,6 +844,12 @@ def evaluate_model(
         "n_runs": len(eval_runs),
         "total_spectra": int(sum(r.time_series.n_spectra for r in eval_runs)),
         "score_stats": _safe_stats(all_scores),
+        "latent_masking": {
+            "latent_mask_pct": float(latent_mask_pct),
+            "latent_mask_seed": latent_mask_seed,
+            "explicit_mask_file_entries": int(len(explicit_mask_map)),
+            "mask_alarm_feedback": bool(mask_alarm_feedback),
+        },
         "runs": run_results,
     }
 
@@ -774,6 +876,9 @@ def evaluate_model(
 def main() -> None:
     args = parse_args()
 
+    if not (0.0 <= float(args.latent_mask_pct) <= 1.0):
+        raise ValueError(f"--latent-mask-pct must be in [0, 1], got {args.latent_mask_pct}")
+
     wandb = _maybe_import_wandb(args.wandb)
     wb_run = None
     if wandb is not None:
@@ -798,6 +903,11 @@ def main() -> None:
     if h5_path is not None and not h5_path.exists():
         raise FileNotFoundError(f"H5 file not found: {h5_path}")
 
+    explicit_mask_path = Path(args.latent_mask_file).resolve() if args.latent_mask_file else None
+    if explicit_mask_path is not None and not explicit_mask_path.exists():
+        raise FileNotFoundError(f"Latent mask file not found: {explicit_mask_path}")
+    explicit_mask_map = _load_explicit_mask_map(explicit_mask_path)
+
     threshold_per_model: Dict[Path, float] = {}
 
     if args.threshold is not None:
@@ -821,6 +931,9 @@ def main() -> None:
                 cal_ts,
                 alarms_per_hour=float(args.alarms_per_hour),
                 verbose=not args.quiet,
+                latent_mask_pct=float(args.latent_mask_pct),
+                mask_seed=args.latent_mask_seed,
+                mask_alarm_feedback=bool(args.mask_alarm_feedback),
             )
             threshold_per_model[model_path] = float(threshold)
             if not args.quiet:
@@ -848,6 +961,10 @@ def main() -> None:
             h5_path=h5_path,
             time_units_override=args.time_units,
             quiet=args.quiet,
+            latent_mask_pct=float(args.latent_mask_pct),
+            latent_mask_seed=args.latent_mask_seed,
+            explicit_mask_map=explicit_mask_map,
+            mask_alarm_feedback=bool(args.mask_alarm_feedback),
         )
 
         all_results.append(result)
@@ -919,6 +1036,10 @@ def main() -> None:
         "threshold_input": args.threshold,
         "alarms_per_hour": args.alarms_per_hour,
         "h5_path": str(h5_path) if h5_path else None,
+        "latent_mask_pct": float(args.latent_mask_pct),
+        "latent_mask_seed": args.latent_mask_seed,
+        "latent_mask_file": str(explicit_mask_path) if explicit_mask_path else None,
+        "mask_alarm_feedback": bool(args.mask_alarm_feedback),
         "results": all_results,
     }
 

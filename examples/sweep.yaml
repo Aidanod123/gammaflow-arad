@@ -40,6 +40,8 @@ parameters:
     value: 0.2
   seed:
     value: 42
+  latent_mask_seed:
+    value: 42
   grad_clip_norm:
     value: 1.0
 
@@ -67,6 +69,10 @@ parameters:
   # setting effective_dropout=0.0 when lstm_layers=1 and logging it explicitly.
   dropout:
     values: [0.0, 0.1, 0.2, 0.3]
+
+  # Zero selected latent history timesteps after encoder projection.
+  latent_mask_pct:
+    values: [0.0, 0.05, 0.1, 0.2]
 
   learning_rate:
     distribution: log_uniform_values

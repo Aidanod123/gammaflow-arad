@@ -68,6 +68,8 @@ def sweep_run() -> None:
             val_fraction=cfg.val_fraction,
             seed=cfg.get("seed", 42),
             grad_clip_norm=cfg.get("grad_clip_norm", 1.0),
+            latent_mask_pct=cfg.get("latent_mask_pct", 0.0),
+            latent_mask_seed=cfg.get("latent_mask_seed", cfg.get("seed", 42)),
             num_workers=cfg.get("num_workers", 0),
             verbose=False,  # keeps logs clean when running many parallel agents
             epoch_end_callback=_log_epoch,
@@ -86,6 +88,7 @@ def sweep_run() -> None:
                 "seq_len": cfg.seq_len,
                 "latent_dim": cfg.latent_dim,
                 "lstm_hidden_dim": cfg.lstm_hidden_dim,
+                "latent_mask_pct": cfg.get("latent_mask_pct", 0.0),
             },
         )
         artifact.add_file(str(result["model_path"]))
