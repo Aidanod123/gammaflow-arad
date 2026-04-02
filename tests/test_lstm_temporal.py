@@ -82,6 +82,7 @@ def test_save_and_load_roundtrip(tmp_path, temporal_series) -> None:
     detector = LSTMTemporalDetector(
         seq_len=4,
         seq_stride=1,
+        use_attention=True,
         threshold=1.23,
         loss_type="chi2",
         verbose=False,
@@ -102,6 +103,7 @@ def test_save_and_load_roundtrip(tmp_path, temporal_series) -> None:
 
     assert loaded.seq_len == detector.seq_len
     assert loaded.seq_stride == detector.seq_stride
+    assert loaded.use_attention == detector.use_attention
     assert loaded.loss_type == detector.loss_type
     assert loaded.threshold == detector.threshold
     assert np.allclose(before, after, equal_nan=True)
@@ -132,6 +134,47 @@ def test_temporal_autoencoder_applies_mask_after_encoder() -> None:
         masked_encoded = encoded.masked_fill(timestep_mask.unsqueeze(-1), 0.0)
         temporal_out, _ = model.temporal_core(masked_encoded)
         decoder_latent = model.temporal_to_latent(temporal_out[:, -1, :])
+        decoded_linear = model.decoder_linear(decoder_latent)
+        decoded_linear = decoded_linear.view(b, 8, model.n_bins // 32)
+        expected = model.decoder(decoded_linear).view(b, model.n_bins)
+
+        observed = model(windows, latent_timestep_mask=timestep_mask)
+
+    assert torch.allclose(expected, observed, atol=1e-6)
+
+
+def test_temporal_autoencoder_attention_masking_matches_manual() -> None:
+    """Attention path should honor timestep masking in attention weights."""
+    model = TemporalLSTMAutoencoder(
+        n_bins=64,
+        latent_dim=4,
+        lstm_hidden_dim=6,
+        lstm_layers=1,
+        dropout=0.0,
+        use_attention=True,
+    )
+    model.eval()
+
+    windows = torch.rand(2, 5, 64)
+    timestep_mask = torch.zeros(2, 5, dtype=torch.bool)
+    timestep_mask[:, -1] = True
+    timestep_mask[:, 1] = True
+
+    with torch.no_grad():
+        b, s, _ = windows.shape
+        encoded = model.encoder(model._normalize_input(windows.reshape(b * s, model.n_bins)))
+        encoded = encoded.view(b, s, model.latent_dim)
+        masked_encoded = encoded.masked_fill(timestep_mask.unsqueeze(-1), 0.0)
+        temporal_out, _ = model.temporal_core(masked_encoded)
+
+        query = temporal_out[:, -1, :].unsqueeze(1)
+        scores = torch.sum(query * temporal_out, dim=-1)
+        scores = scores.masked_fill(timestep_mask, float("-inf"))
+        attn = torch.softmax(scores, dim=-1)
+        attn = torch.nan_to_num(attn, nan=0.0)
+        context = torch.sum(temporal_out * attn.unsqueeze(-1), dim=1)
+
+        decoder_latent = model.temporal_to_latent(context)
         decoded_linear = model.decoder_linear(decoder_latent)
         decoded_linear = decoded_linear.view(b, 8, model.n_bins // 32)
         expected = model.decoder(decoded_linear).view(b, model.n_bins)

@@ -38,6 +38,8 @@ parameters:
     values: [256, 384]
   lstm_layers:
     values: [1, 2]
+  use_attention:
+    values: [false, true]
   dropout:
     values: [0.1, 0.2, 0.3]
   latent_mask_pct:

@@ -335,15 +335,31 @@ class ARADDetector(BaseDetector):
             print(f"Training on {len(train_data)} spectra, validating on {len(val_data)}")
             print(f"Loss function: {self.loss_type.upper()}")
 
+        if len(train_data) < 2:
+            raise ValueError(
+                "ARAD training requires at least 2 training spectra for BatchNorm. "
+                "Reduce validation_split or provide more training data."
+            )
+        if len(val_data) == 0:
+            raise ValueError(
+                "Validation set is empty. Increase validation_split or provide more data."
+            )
+
         train_tensor = torch.FloatTensor(train_data).to(self.device)
         val_tensor = torch.FloatTensor(val_data).to(self.device)
 
         train_loader = DataLoader(
-            TensorDataset(train_tensor), batch_size=self.batch_size, shuffle=True
+            TensorDataset(train_tensor), batch_size=self.batch_size, shuffle=True, drop_last=True
         )
         val_loader = DataLoader(
             TensorDataset(val_tensor), batch_size=self.batch_size
         )
+
+        if len(train_loader) == 0:
+            raise ValueError(
+                "No full training batches were created (likely batch_size > number of "
+                "training spectra). Reduce batch_size or provide more training data."
+            )
 
         self.model_ = ARADAutoencoder(
             n_bins=self.n_bins_,

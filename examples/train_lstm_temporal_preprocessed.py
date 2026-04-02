@@ -46,11 +46,20 @@ def _build_wandb_config(args: argparse.Namespace) -> Dict[str, Any]:
         "lstm_hidden_dim": args.lstm_hidden_dim,
         "lstm_layers": args.lstm_layers,
         "dropout": args.dropout,
+        "use_attention": args.use_attention,
         "loss_type": args.loss_type,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
+        "scheduler_factor": args.scheduler_factor,
+        "scheduler_patience": args.scheduler_patience,
+        "scheduler_min_lr": args.scheduler_min_lr,
+        "scheduler_threshold": args.scheduler_threshold,
+        "scheduler_cooldown": args.scheduler_cooldown,
         "batch_size": args.batch_size,
         "epochs": args.epochs,
+        "min_epochs": args.min_epochs,
+        "early_stopping_patience": args.early_stopping_patience,
+        "early_stopping_min_delta": args.early_stopping_min_delta,
         "val_fraction": args.val_fraction,
         "seed": args.seed,
         "num_workers": args.num_workers,
@@ -85,11 +94,64 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lstm-hidden-dim", type=int, default=128)
     parser.add_argument("--lstm-layers", type=int, default=1)
     parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument(
+        "--use-attention",
+        action="store_true",
+        help="Enable temporal attention context over LSTM outputs",
+    )
     parser.add_argument("--loss-type", type=str, default="jsd", choices=["mse", "jsd", "chi2"])
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
+    parser.add_argument(
+        "--scheduler-factor",
+        type=float,
+        default=0.5,
+        help="ReduceLROnPlateau multiplicative LR factor in (0, 1)",
+    )
+    parser.add_argument(
+        "--scheduler-patience",
+        type=int,
+        default=3,
+        help="Epochs with no val-loss improvement before LR decay",
+    )
+    parser.add_argument(
+        "--scheduler-min-lr",
+        type=float,
+        default=1e-6,
+        help="Minimum LR floor for scheduler",
+    )
+    parser.add_argument(
+        "--scheduler-threshold",
+        type=float,
+        default=1e-4,
+        help="Minimum val-loss delta to be treated as LR-scheduler improvement",
+    )
+    parser.add_argument(
+        "--scheduler-cooldown",
+        type=int,
+        default=1,
+        help="Cooldown epochs after an LR reduction",
+    )
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument(
+        "--min-epochs",
+        type=int,
+        default=10,
+        help="Minimum epochs to run before early stopping is allowed",
+    )
+    parser.add_argument(
+        "--early-stopping-patience",
+        type=int,
+        default=8,
+        help="Epochs without meaningful val-loss improvement before stop",
+    )
+    parser.add_argument(
+        "--early-stopping-min-delta",
+        type=float,
+        default=1e-4,
+        help="Minimum val-loss improvement to reset early-stopping patience",
+    )
     parser.add_argument("--val-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -163,6 +225,10 @@ def main() -> None:
                     "val/loss": float(metrics["val_loss"]),
                     "train/lr": float(metrics["lr"]),
                     "train/best_val_loss": float(metrics["best_val_loss"]),
+                    "train/best_epoch": int(metrics.get("best_epoch", 0)),
+                    "train/epochs_without_improvement": int(
+                        metrics.get("epochs_without_improvement", 0)
+                    ),
                 },
                 step=int(metrics["epoch"]),
             )
@@ -178,11 +244,20 @@ def main() -> None:
         lstm_hidden_dim=args.lstm_hidden_dim,
         lstm_layers=args.lstm_layers,
         dropout=args.dropout,
+        use_attention=args.use_attention,
         loss_type=args.loss_type,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
+        scheduler_factor=args.scheduler_factor,
+        scheduler_patience=args.scheduler_patience,
+        scheduler_min_lr=args.scheduler_min_lr,
+        scheduler_threshold=args.scheduler_threshold,
+        scheduler_cooldown=args.scheduler_cooldown,
         batch_size=args.batch_size,
         epochs=args.epochs,
+        min_epochs=args.min_epochs,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_min_delta=args.early_stopping_min_delta,
         val_fraction=args.val_fraction,
         seed=args.seed,
         num_workers=args.num_workers,
@@ -198,6 +273,10 @@ def main() -> None:
 
     if wb_run is not None:
         wandb.summary["best_val_loss"] = float(result["best_val_loss"])
+        wandb.summary["best_epoch"] = int(result.get("best_epoch", 0))
+        wandb.summary["epochs_completed"] = int(result.get("epochs_completed", 0))
+        wandb.summary["stopped_early"] = bool(result.get("stopped_early", False))
+        wandb.summary["stop_reason"] = str(result.get("stop_reason", ""))
         wandb.summary["model_path"] = str(result["model_path"])
         wandb.summary["metrics_path"] = str(result["metrics_path"])
 
@@ -209,7 +288,11 @@ def main() -> None:
                 "loss_type": args.loss_type,
                 "seq_len": args.seq_len,
                 "seq_stride": args.seq_stride,
+                "use_attention": args.use_attention,
                 "latent_mask_pct": args.latent_mask_pct,
+                "best_epoch": int(result.get("best_epoch", 0)),
+                "epochs_completed": int(result.get("epochs_completed", 0)),
+                "stopped_early": bool(result.get("stopped_early", False)),
             },
         )
         model_artifact.add_file(str(result["model_path"]))
@@ -239,6 +322,9 @@ def main() -> None:
     print(f"Model:   {result['model_path']}")
     print(f"Metrics: {result['metrics_path']}")
     print(f"Best val loss: {result['best_val_loss']:.6f}")
+    print(f"Best epoch: {int(result.get('best_epoch', 0))}")
+    print(f"Epochs completed: {int(result.get('epochs_completed', 0))}")
+    print(f"Stopped early: {bool(result.get('stopped_early', False))}")
 
 
 if __name__ == "__main__":

@@ -6,19 +6,19 @@ metric:
 
 early_terminate:
   type: hyperband
-  min_iter: 5
+  min_iter: 6
   eta: 2
   s: 2
 
-run_cap: 50
+run_cap: 40
 
 parameters:
   preprocessed_dir:
-    value: preprocessed-data/no-sources-1.0-0.5-b256
+    value: preprocessed-data/no-sources-1.0-0.5
   epochs:
-    value: 40
+    value: 45
   batch_size:
-    value: 128
+    value: 256
   val_fraction:
     value: 0.2
   seed:
@@ -28,26 +28,28 @@ parameters:
   grad_clip_norm:
     value: 1.0
 
+  use_attention:
+    value: true
   loss_type:
     values: [jsd, chi2]
   seq_len:
-    values: [10, 20]
+    values: [16, 20, 24]
+  seq_stride:
+    value: 1
   latent_dim:
-    values: [96, 128]
+    values: [64, 96, 128]
   lstm_hidden_dim:
-    values: [192, 256]
+    value: 192
   lstm_layers:
     values: [1, 2]
-  use_attention:
-    values: [false, true]
   dropout:
     values: [0.1, 0.2, 0.3]
   latent_mask_pct:
-    values: [0.0, 0.05, 0.1]
+    values: [0.0, 0.05, 0.1, 0.15]
 
   learning_rate:
     distribution: log_uniform_values
-    min: 8.0e-5
+    min: 5.0e-5
     max: 2.0e-3
   weight_decay:
     distribution: log_uniform_values

@@ -156,6 +156,21 @@ def parse_args() -> argparse.Namespace:
         help="Override time units when reading dt from H5 (default: infer from run payload)",
     )
     parser.add_argument(
+        "--ground-truth-score-run",
+        type=str,
+        default="random",
+        help=(
+            "Run selector for detailed per-spectrum GT score dump when --h5-path is provided. "
+            "Use 'random' (default), or run file/name/index (e.g., run0.pt, run0, 0)."
+        ),
+    )
+    parser.add_argument(
+        "--ground-truth-score-seed",
+        type=int,
+        default=42,
+        help="Seed used when --ground-truth-score-run=random",
+    )
+    parser.add_argument(
         "--latent-mask-pct",
         type=float,
         default=0.0,
@@ -192,6 +207,35 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Optional cap on number of calibration background runs",
+    )
+    parser.add_argument(
+        "--calibration-use-val-runs",
+        action="store_true",
+        default=True,
+        help=(
+            "(default: True) Calibrate thresholds using validation runs listed "
+            "in each model's <model>.metrics.json (val_runs) instead of all "
+            "runs in --calibration-dir."
+        ),
+    )
+    parser.add_argument(
+        "--calibration-use-all-runs",
+        action="store_true",
+        default=False,
+        help=(
+            "Override --calibration-use-val-runs and calibrate on ALL runs in "
+            "--calibration-dir, including training data. Use with caution: "
+            "thresholds calibrated on training data can underestimate FAR."
+        ),
+    )
+    parser.add_argument(
+        "--calibration-metrics-path",
+        type=str,
+        default=None,
+        help=(
+            "Optional explicit metrics JSON path containing val_runs for calibration. "
+            "If provided with multiple models, the same val_runs list is applied to all."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -626,6 +670,84 @@ def _load_explicit_mask_map(mask_file: Optional[Path]) -> Dict[str, List[int]]:
     return out
 
 
+def _load_val_runs_from_metrics(metrics_path: Path) -> List[str]:
+    with metrics_path.open("r", encoding="utf-8") as f:
+        payload = json.load(f)
+
+    val_runs = payload.get("val_runs")
+    if not isinstance(val_runs, list) or not val_runs:
+        raise ValueError(
+            f"Metrics file '{metrics_path}' does not contain a non-empty 'val_runs' list"
+        )
+
+    out: List[str] = []
+    for item in val_runs:
+        name = str(item).strip()
+        if not name:
+            continue
+        # Normalize to filename to tolerate absolute/relative paths in metrics.
+        out.append(Path(name).name)
+
+    if not out:
+        raise ValueError(
+            f"Metrics file '{metrics_path}' has an empty/invalid 'val_runs' list"
+        )
+    return out
+
+
+def _resolve_calibration_files_for_model(
+    model_path: Path,
+    all_cal_files: Sequence[Path],
+    use_val_runs: bool,
+    metrics_path_override: Optional[Path],
+    max_calibration_runs: Optional[int],
+) -> List[Path]:
+    if not use_val_runs:
+        files = list(all_cal_files)
+        if max_calibration_runs is not None:
+            files = files[:max_calibration_runs]
+        return files
+
+    metrics_path = (
+        metrics_path_override.resolve()
+        if metrics_path_override is not None
+        else model_path.with_suffix(".metrics.json")
+    )
+    if not metrics_path.exists():
+        raise FileNotFoundError(
+            "Validation-only calibration requested, but metrics file was not found: "
+            f"{metrics_path}"
+        )
+
+    val_run_names = _load_val_runs_from_metrics(metrics_path)
+    file_by_name = {p.name: p for p in all_cal_files}
+
+    selected: List[Path] = []
+    missing: List[str] = []
+    for run_name in val_run_names:
+        matched = file_by_name.get(run_name)
+        if matched is None:
+            missing.append(run_name)
+        else:
+            selected.append(matched)
+
+    if not selected:
+        raise ValueError(
+            "No calibration files matched metrics val_runs for model "
+            f"'{model_path.name}'. Checked metrics: {metrics_path}"
+        )
+    if missing:
+        preview = ", ".join(missing[:5])
+        raise ValueError(
+            "Some val_runs from metrics were not found in calibration-dir: "
+            f"{preview}{' ...' if len(missing) > 5 else ''}"
+        )
+
+    if max_calibration_runs is not None:
+        selected = selected[:max_calibration_runs]
+    return selected
+
+
 def _resolve_run_mask_indices(
     explicit_mask_map: Dict[str, List[int]],
     run: RunData,
@@ -653,20 +775,55 @@ def _flatten_dict(prefix: str, payload: Dict[str, Any], out: Dict[str, Any]) -> 
             out[full_key] = value
 
 
+def _resolve_gt_score_run(eval_runs: Sequence[RunData], selector: Optional[str], seed: int) -> RunData:
+    if not eval_runs:
+        raise ValueError("No eval runs available to resolve ground-truth score run")
+
+    s = (selector or "random").strip().lower()
+    if s == "random":
+        rng = np.random.default_rng(int(seed))
+        idx = int(rng.integers(0, len(eval_runs)))
+        return eval_runs[idx]
+
+    raw = (selector or "").strip()
+    normalized = raw if raw.endswith(".pt") else f"{raw}.pt" if raw.startswith("run") else raw
+
+    for run in eval_runs:
+        if run.run_name == normalized or Path(run.run_name).stem == raw:
+            return run
+
+    if raw.isdigit():
+        run_id = int(raw)
+        for run in eval_runs:
+            if run.run_id == run_id:
+                return run
+
+    preview = ", ".join(r.run_name for r in eval_runs[:8])
+    raise ValueError(
+        f"Could not resolve --ground-truth-score-run='{selector}'. "
+        f"Available examples: {preview}{' ...' if len(eval_runs) > 8 else ''}"
+    )
+
+
 def _build_eval_wandb_config(args: argparse.Namespace) -> Dict[str, Any]:
     return {
         "eval_dir": args.eval_dir,
         "calibration_dir": args.calibration_dir,
         "max_calibration_runs": args.max_calibration_runs,
+        "calibration_use_val_runs": args.calibration_use_val_runs,
+        "calibration_metrics_path": args.calibration_metrics_path,
         "threshold": args.threshold,
         "alarms_per_hour": args.alarms_per_hour,
         "h5_path": args.h5_path,
         "time_units": args.time_units,
+        "ground_truth_score_run": args.ground_truth_score_run,
+        "ground_truth_score_seed": args.ground_truth_score_seed,
         "max_runs": args.max_runs,
         "latent_mask_pct": args.latent_mask_pct,
         "latent_mask_seed": args.latent_mask_seed,
         "latent_mask_file": args.latent_mask_file,
         "mask_alarm_feedback": args.mask_alarm_feedback,
+        "force_target_mask_in_attention": True,
     }
 
 
@@ -709,14 +866,18 @@ def evaluate_model(
     latent_mask_seed: Optional[int],
     explicit_mask_map: Dict[str, List[int]],
     mask_alarm_feedback: bool,
+    gt_score_run_name: Optional[str],
+    gt_scores_output_path: Optional[Path],
 ) -> Dict[str, object]:
     detector = LSTMTemporalDetector(verbose=not quiet)
     detector.load(str(model_path))
     detector.set_threshold(float(threshold))
 
     run_results: List[Dict[str, object]] = []
+    all_scores_parts: List[np.ndarray] = []
     point_metric_rows: List[LabelMetrics] = []
     overlap_rows: List[TimeOverlapMetrics] = []
+    gt_scores_written_path: Optional[Path] = None
 
     for run in eval_runs:
         ts = run.time_series
@@ -736,6 +897,7 @@ def evaluate_model(
 
         finite_scores = scores[np.isfinite(scores)]
         threshold_crossings = int(np.sum(finite_scores > detector.threshold))
+        all_scores_parts.append(np.asarray(scores, dtype=float))
 
         run_out: Dict[str, object] = {
             "run_name": run.run_name,
@@ -753,6 +915,7 @@ def evaluate_model(
                 "latent_mask_seed": run_mask_seed,
                 "explicit_mask_count": int(len(run_mask_indices or [])),
                 "mask_alarm_feedback": bool(mask_alarm_feedback),
+                "use_attention": bool(detector.use_attention),
             },
         }
 
@@ -820,27 +983,60 @@ def evaluate_model(
                 "time_coverage_rate": o.time_coverage_rate,
             }
 
+            valid = np.isfinite(scores)
+            anomaly_scores = np.asarray(scores, dtype=float)[valid & labels]
+            normal_scores = np.asarray(scores, dtype=float)[valid & (~labels)]
+            run_out["ground_truth_score_stats"] = {
+                "n_anomalous": int(np.sum(labels)),
+                "n_normal": int(np.sum(~labels)),
+                "anomalous": _safe_stats(anomaly_scores),
+                "normal": _safe_stats(normal_scores),
+            }
+
+            if (
+                gt_score_run_name is not None
+                and run.run_name == gt_score_run_name
+                and gt_scores_output_path is not None
+            ):
+                rows: List[Dict[str, object]] = []
+                score_arr = np.asarray(scores, dtype=float)
+                for i in range(len(score_arr)):
+                    v = score_arr[i]
+                    rows.append(
+                        {
+                            "spectrum_index": int(i),
+                            "score": None if not np.isfinite(v) else float(v),
+                            "is_anomaly": bool(labels[i]),
+                        }
+                    )
+
+                gt_dump = {
+                    "run": run.run_name,
+                    "run_id": run.run_id,
+                    "threshold": float(detector.threshold),
+                    "n_spectra": int(ts.n_spectra),
+                    "labels_are_source_present": True,
+                    "anomalous_scores": [float(x) for x in anomaly_scores.tolist()],
+                    "normal_scores": [float(x) for x in normal_scores.tolist()],
+                    "rows": rows,
+                }
+                gt_scores_output_path.parent.mkdir(parents=True, exist_ok=True)
+                with gt_scores_output_path.open("w", encoding="utf-8") as f:
+                    json.dump(_to_builtin(gt_dump), f, indent=2)
+                gt_scores_written_path = gt_scores_output_path
+
         run_results.append(run_out)
 
-    all_scores = np.concatenate(
-        [
-            detector.score_time_series(
-                r.time_series,
-                mask_indices=_resolve_run_mask_indices(explicit_mask_map, r),
-                latent_mask_pct=float(latent_mask_pct),
-                mask_seed=(int(latent_mask_seed) + int(r.run_id))
-                if (latent_mask_seed is not None and r.run_id is not None)
-                else latent_mask_seed,
-                mask_alarm_feedback=bool(mask_alarm_feedback),
-                feedback_threshold=float(detector.threshold),
-            )
-            for r in eval_runs
-        ]
+    all_scores = (
+        np.concatenate(all_scores_parts)
+        if all_scores_parts
+        else np.array([], dtype=float)
     )
 
     summary: Dict[str, object] = {
         "model_path": str(model_path),
         "threshold": float(detector.threshold),
+        "use_attention": bool(detector.use_attention),
         "n_runs": len(eval_runs),
         "total_spectra": int(sum(r.time_series.n_spectra for r in eval_runs)),
         "score_stats": _safe_stats(all_scores),
@@ -850,6 +1046,7 @@ def evaluate_model(
             "explicit_mask_file_entries": int(len(explicit_mask_map)),
             "mask_alarm_feedback": bool(mask_alarm_feedback),
         },
+        "ground_truth_scores_path": str(gt_scores_written_path) if gt_scores_written_path else None,
         "runs": run_results,
     }
 
@@ -875,6 +1072,15 @@ def evaluate_model(
 
 def main() -> None:
     args = parse_args()
+
+    # --calibration-use-all-runs overrides the default val-runs-only behavior.
+    if args.calibration_use_all_runs:
+        args.calibration_use_val_runs = False
+        print(
+            "WARNING: --calibration-use-all-runs is set. Threshold will be "
+            "calibrated on all runs in --calibration-dir, including data the "
+            "model may have been trained on. FAR estimates may be optimistic."
+        )
 
     if not (0.0 <= float(args.latent_mask_pct) <= 1.0):
         raise ValueError(f"--latent-mask-pct must be in [0, 1], got {args.latent_mask_pct}")
@@ -907,6 +1113,13 @@ def main() -> None:
     if explicit_mask_path is not None and not explicit_mask_path.exists():
         raise FileNotFoundError(f"Latent mask file not found: {explicit_mask_path}")
     explicit_mask_map = _load_explicit_mask_map(explicit_mask_path)
+    gt_score_run: Optional[RunData] = None
+    if h5_path is not None:
+        gt_score_run = _resolve_gt_score_run(
+            eval_runs=eval_runs,
+            selector=args.ground_truth_score_run,
+            seed=int(args.ground_truth_score_seed),
+        )
 
     threshold_per_model: Dict[Path, float] = {}
 
@@ -920,11 +1133,27 @@ def main() -> None:
             )
 
         cal_dir = Path(args.calibration_dir).resolve()
-        cal_files = _discover_run_files(cal_dir, max_runs=args.max_calibration_runs)
-        cal_runs = [_load_run_data(p) for p in cal_files]
-        cal_ts = _build_concatenated_time_series(cal_runs)
+        all_cal_files = _discover_run_files(cal_dir, max_runs=None)
+
+        metrics_path_override = None
+        if args.calibration_metrics_path:
+            metrics_path_override = Path(args.calibration_metrics_path).resolve()
+            if not metrics_path_override.exists():
+                raise FileNotFoundError(
+                    f"Calibration metrics file not found: {metrics_path_override}"
+                )
 
         for model_path in model_paths:
+            model_cal_files = _resolve_calibration_files_for_model(
+                model_path=model_path,
+                all_cal_files=all_cal_files,
+                use_val_runs=bool(args.calibration_use_val_runs),
+                metrics_path_override=metrics_path_override,
+                max_calibration_runs=args.max_calibration_runs,
+            )
+            cal_runs = [_load_run_data(p) for p in model_cal_files]
+            cal_ts = _build_concatenated_time_series(cal_runs)
+
             detector = LSTMTemporalDetector(verbose=not args.quiet)
             detector.load(str(model_path))
             threshold = detector.set_threshold_by_far(
@@ -939,7 +1168,8 @@ def main() -> None:
             if not args.quiet:
                 print(
                     f"[calibration] {model_path.name}: threshold={threshold:.6f} "
-                    f"at target FAR={args.alarms_per_hour:.3f}/hr"
+                    f"at target FAR={args.alarms_per_hour:.3f}/hr "
+                    f"using {len(model_cal_files)} runs"
                 )
 
     output_dir = Path(args.output_dir).resolve()
@@ -965,6 +1195,12 @@ def main() -> None:
             latent_mask_seed=args.latent_mask_seed,
             explicit_mask_map=explicit_mask_map,
             mask_alarm_feedback=bool(args.mask_alarm_feedback),
+            gt_score_run_name=(gt_score_run.run_name if gt_score_run is not None else None),
+            gt_scores_output_path=(
+                output_dir / f"{model_path.stem}.{Path(gt_score_run.run_name).stem}.ground_truth_scores.json"
+                if gt_score_run is not None
+                else None
+            ),
         )
 
         all_results.append(result)
@@ -1027,15 +1263,22 @@ def main() -> None:
             json.dump(_to_builtin(result), f, indent=2)
 
         print(f"Wrote {out_file}")
+        gt_path = result.get("ground_truth_scores_path")
+        if isinstance(gt_path, str) and gt_path:
+            print(f"Wrote {gt_path}")
 
     summary = {
         "models": [str(p) for p in model_paths],
         "eval_dir": str(eval_dir),
         "calibration_dir": str(Path(args.calibration_dir).resolve()) if args.calibration_dir else None,
         "max_calibration_runs": args.max_calibration_runs,
+        "calibration_use_val_runs": bool(args.calibration_use_val_runs),
+        "calibration_metrics_path": str(Path(args.calibration_metrics_path).resolve()) if args.calibration_metrics_path else None,
         "threshold_input": args.threshold,
         "alarms_per_hour": args.alarms_per_hour,
         "h5_path": str(h5_path) if h5_path else None,
+        "ground_truth_score_run": gt_score_run.run_name if gt_score_run else None,
+        "ground_truth_score_seed": int(args.ground_truth_score_seed),
         "latent_mask_pct": float(args.latent_mask_pct),
         "latent_mask_seed": args.latent_mask_seed,
         "latent_mask_file": str(explicit_mask_path) if explicit_mask_path else None,

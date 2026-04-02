@@ -36,6 +36,16 @@ from gammaflow.algorithms.base import BaseDetector
 from gammaflow.algorithms.arad import ARADEncoderBlock, ARADDecoderBlock
 
 
+def _score_batch_fn(
+    targets: "torch.Tensor",
+    recon: "torch.Tensor",
+    loss_type: str,
+) -> "torch.Tensor":
+    """Lazy wrapper that imports from training.losses on first call."""
+    from gammaflow.training.losses import score_batch  # noqa: deferred to avoid circular import
+    return score_batch(targets, recon, loss_type)
+
+
 @dataclass
 class TemporalModelConfig:
     """Configuration used to initialize the temporal model."""
@@ -45,6 +55,7 @@ class TemporalModelConfig:
     lstm_hidden_dim: int
     lstm_layers: int
     dropout: float
+    use_attention: bool
 
 
 class TemporalLSTMAutoencoder(nn.Module):
@@ -67,6 +78,7 @@ class TemporalLSTMAutoencoder(nn.Module):
         lstm_hidden_dim: int = 128,
         lstm_layers: int = 1,
         dropout: float = 0.2,
+        use_attention: bool = False,
     ):
         super().__init__()
 
@@ -75,6 +87,7 @@ class TemporalLSTMAutoencoder(nn.Module):
         self.lstm_hidden_dim = int(lstm_hidden_dim)
         self.lstm_layers = int(lstm_layers)
         self.dropout = float(dropout)
+        self.use_attention = bool(use_attention)
 
         if self.n_bins % 32 != 0:
             raise ValueError(
@@ -179,7 +192,33 @@ class TemporalLSTMAutoencoder(nn.Module):
             encoded = encoded.masked_fill(mask.unsqueeze(-1), 0.0)
 
         temporal_out, _ = self.temporal_core(encoded)
-        final_embedding = temporal_out[:, -1, :]
+        if self.use_attention:
+            # NOTE: When use_attention=True, external trainer_fn should pass a mask
+            # with target timestep (-1) set True to prevent identity shortcut.
+            query = temporal_out[:, -1, :].unsqueeze(1)
+            scores = torch.sum(query * temporal_out, dim=-1)
+
+            if latent_timestep_mask is not None:
+                score_mask = mask
+                scores.masked_fill_(score_mask, float("-inf"))
+                fully_masked = score_mask.all(dim=1)
+                if torch.any(fully_masked):
+                    scores[fully_masked] = 0.0
+                    score_mask = score_mask.clone()
+                    score_mask[fully_masked, :] = False
+                    score_mask[fully_masked, -1] = True
+                    scores.masked_fill_(score_mask, float("-inf"))
+
+            attention_weights = torch.softmax(scores, dim=-1)
+            attention_weights = torch.nan_to_num(attention_weights, nan=0.0)
+            context_vector = torch.sum(
+                temporal_out * attention_weights.unsqueeze(-1),
+                dim=1,
+            )
+            final_embedding = context_vector
+        else:
+            final_embedding = temporal_out[:, -1, :]
+
         decoder_latent = self.temporal_to_latent(final_embedding)
         decoded_linear = self.decoder_linear(decoder_latent)
         decoded_linear = decoded_linear.view(batch_size, 8, self._downsampled_bins)
@@ -212,6 +251,9 @@ class LSTMTemporalDetector(BaseDetector):
         Number of stacked LSTM layers.
     dropout : float
         Dropout used in model blocks.
+    use_attention : bool
+        If True, reconstruct from attention-weighted temporal context instead
+        of directly using only the final LSTM timestep embedding.
     threshold : float or None
         Detection threshold. If None, set via ``set_threshold`` or FAR calibration.
     aggregation_gap : float
@@ -232,6 +274,7 @@ class LSTMTemporalDetector(BaseDetector):
         lstm_hidden_dim: int = 128,
         lstm_layers: int = 1,
         dropout: float = 0.2,
+        use_attention: bool = False,
         threshold: Optional[float] = None,
         aggregation_gap: float = 2.0,
         loss_type: str = "jsd",
@@ -264,6 +307,7 @@ class LSTMTemporalDetector(BaseDetector):
         self.lstm_hidden_dim = int(lstm_hidden_dim)
         self.lstm_layers = int(lstm_layers)
         self.dropout = float(dropout)
+        self.use_attention = bool(use_attention)
         self.loss_type = str(loss_type).lower()
         self.verbose = bool(verbose)
 
@@ -304,6 +348,7 @@ class LSTMTemporalDetector(BaseDetector):
             lstm_hidden_dim=self.lstm_hidden_dim,
             lstm_layers=self.lstm_layers,
             dropout=self.dropout,
+            use_attention=self.use_attention,
         ).to(self.device)
         self.model_.eval()
         return self
@@ -356,30 +401,9 @@ class LSTMTemporalDetector(BaseDetector):
             "Use process_time_series(...) instead of score_spectrum(...)."
         )
 
-    def _normalize_for_jsd(self, x: torch.Tensor) -> torch.Tensor:
-        eps = 1e-10
-        x = torch.clamp(x, min=eps)
-        return x / torch.clamp(torch.sum(x, dim=-1, keepdim=True), min=eps)
-
-    def _jsd_score(self, target: torch.Tensor, recon: torch.Tensor) -> torch.Tensor:
-        p = self._normalize_for_jsd(target)
-        q = self._normalize_for_jsd(recon)
-        m = 0.5 * (p + q)
-        kld_pm = torch.sum(p * torch.log(torch.clamp(p / m, min=1e-10)), dim=-1)
-        kld_qm = torch.sum(q * torch.log(torch.clamp(q / m, min=1e-10)), dim=-1)
-        return torch.sqrt(0.5 * (kld_pm + kld_qm))
-
-    def _chi2_score(self, target: torch.Tensor, recon: torch.Tensor) -> torch.Tensor:
-        eps = 1e-8
-        max_vals = torch.max(target, dim=1, keepdim=True).values
-        recon_denorm = recon * (max_vals + eps)
-        recon_denorm = torch.clamp(recon_denorm, min=eps)
-        return torch.sum((target - recon_denorm) ** 2 / recon_denorm, dim=-1)
-
     def _score_batch(self, targets: torch.Tensor, recon: torch.Tensor) -> torch.Tensor:
-        if self.loss_type == "jsd":
-            return self._jsd_score(targets, recon)
-        return self._chi2_score(targets, recon)
+        """Per-sample anomaly scores.  Delegates to ``gammaflow.training.losses``."""
+        return _score_batch_fn(targets, recon, self.loss_type)
 
     def _window_indices_for_end(self, end_idx: int) -> Optional[np.ndarray]:
         offsets = np.arange(self.seq_len - 1, -1, -1, dtype=int) * self.seq_stride
@@ -404,12 +428,13 @@ class LSTMTemporalDetector(BaseDetector):
         masked_index_set: Optional[Set[int]],
         latent_mask_pct: float,
         rng: Optional[np.random.Generator],
+        mask_target_timestep: bool = False,
     ) -> Optional[np.ndarray]:
         mask = np.zeros(self.seq_len, dtype=bool)
         history_len = self.seq_len - 1
 
         if history_len <= 0:
-            return None
+            return np.array([True], dtype=bool) if mask_target_timestep else None
 
         if masked_index_set:
             mask[:history_len] = np.isin(
@@ -421,6 +446,9 @@ class LSTMTemporalDetector(BaseDetector):
             random_mask = rng.random(history_len) < float(latent_mask_pct)
             mask[:history_len] = np.logical_or(mask[:history_len], random_mask)
 
+        if mask_target_timestep:
+            mask[-1] = True
+
         return mask if bool(mask.any()) else None
 
     def score_time_series(
@@ -431,12 +459,18 @@ class LSTMTemporalDetector(BaseDetector):
         mask_seed: Optional[int] = None,
         mask_alarm_feedback: bool = False,
         feedback_threshold: Optional[float] = None,
+        inference_batch_size: int = 256,
     ) -> np.ndarray:
         """
         Score time series with causal rolling windows.
 
         Returns one score per input spectrum. Entries without enough history
         are ``np.nan``.
+
+        When ``mask_alarm_feedback`` is False, windows are pre-built and scored
+        in batches of ``inference_batch_size`` for significantly faster GPU
+        utilisation.  When alarm feedback is enabled, scoring falls back to a
+        sequential loop because each score can influence later masks.
 
         Parameters
         ----------
@@ -456,6 +490,8 @@ class LSTMTemporalDetector(BaseDetector):
         feedback_threshold : float, optional
             Threshold used for alarm-feedback masking. When ``None``, uses
             ``self.threshold``.
+        inference_batch_size : int
+            Number of windows per forward pass when using the batched path.
         """
         if not self.is_trained:
             raise RuntimeError(
@@ -485,10 +521,119 @@ class LSTMTemporalDetector(BaseDetector):
             )
 
         metrics = np.full(counts.shape[0], np.nan, dtype=float)
-        rng = np.random.default_rng(mask_seed) if float(latent_mask_pct) > 0.0 else None
+
         masked_index_set: Optional[Set[int]] = None
         if mask_indices is not None:
             masked_index_set = {int(i) for i in mask_indices if int(i) >= 0}
+
+        if mask_alarm_feedback:
+            self._score_sequential(
+                counts=counts,
+                metrics=metrics,
+                masked_index_set=masked_index_set,
+                latent_mask_pct=float(latent_mask_pct),
+                mask_seed=mask_seed,
+                threshold_for_feedback=threshold_for_feedback,
+            )
+        else:
+            self._score_batched(
+                counts=counts,
+                metrics=metrics,
+                masked_index_set=masked_index_set,
+                latent_mask_pct=float(latent_mask_pct),
+                mask_seed=mask_seed,
+                batch_size=max(1, int(inference_batch_size)),
+            )
+
+        return metrics
+
+    # ------------------------------------------------------------------
+    # Batched scoring (no alarm-feedback dependency between windows)
+    # ------------------------------------------------------------------
+
+    def _score_batched(
+        self,
+        counts: np.ndarray,
+        metrics: np.ndarray,
+        masked_index_set: Optional[Set[int]],
+        latent_mask_pct: float,
+        mask_seed: Optional[int],
+        batch_size: int,
+    ) -> None:
+        """Pre-build all windows then score in GPU-friendly batches."""
+        rng = np.random.default_rng(mask_seed) if latent_mask_pct > 0.0 else None
+        static_mask_set: Set[int] = set(masked_index_set or set())
+
+        # --- Phase 1: pre-materialise windows, targets and masks ----------
+        valid_indices: List[int] = []
+        windows_list: List[np.ndarray] = []
+        masks_list: List[Optional[np.ndarray]] = []
+
+        for i in range(counts.shape[0]):
+            win_idx = self._window_indices_for_end(i)
+            if win_idx is None:
+                continue
+            valid_indices.append(i)
+            windows_list.append(counts[win_idx])
+            masks_list.append(
+                self._build_latent_mask_for_window(
+                    window_indices=win_idx,
+                    masked_index_set=static_mask_set,
+                    latent_mask_pct=latent_mask_pct,
+                    rng=rng,
+                    mask_target_timestep=bool(self.use_attention),
+                )
+            )
+
+        if not valid_indices:
+            return
+
+        all_windows = np.stack(windows_list)              # (N, seq_len, n_bins)
+        all_targets = counts[valid_indices]                # (N, n_bins)
+
+        has_any_mask = any(m is not None for m in masks_list)
+        all_masks: Optional[np.ndarray] = None
+        if has_any_mask:
+            all_masks = np.zeros((len(valid_indices), self.seq_len), dtype=bool)
+            for j, m in enumerate(masks_list):
+                if m is not None:
+                    all_masks[j] = m
+
+        # --- Phase 2: batched forward passes ------------------------------
+        self.model_.eval()
+        with torch.no_grad():
+            for start in range(0, len(valid_indices), batch_size):
+                end = min(start + batch_size, len(valid_indices))
+
+                win_t = torch.from_numpy(all_windows[start:end]).to(self.device)
+                tgt_t = torch.from_numpy(all_targets[start:end]).to(self.device)
+
+                mask_t = None
+                if all_masks is not None:
+                    mask_t = torch.from_numpy(all_masks[start:end]).to(self.device)
+
+                recon = self.model_(win_t, latent_timestep_mask=mask_t)
+                scores = self._score_batch(tgt_t, recon)
+                scores_np = scores.cpu().numpy()
+
+                for j, idx in enumerate(valid_indices[start:end]):
+                    metrics[idx] = float(scores_np[j])
+
+    # ------------------------------------------------------------------
+    # Sequential scoring (alarm-feedback: each score can mask later windows)
+    # ------------------------------------------------------------------
+
+    def _score_sequential(
+        self,
+        counts: np.ndarray,
+        metrics: np.ndarray,
+        masked_index_set: Optional[Set[int]],
+        latent_mask_pct: float,
+        mask_seed: Optional[int],
+        threshold_for_feedback: Optional[float],
+    ) -> None:
+        """One-at-a-time scoring with alarm-feedback masking."""
+        rng = np.random.default_rng(mask_seed) if latent_mask_pct > 0.0 else None
         dynamic_masked_index_set: Set[int] = set(masked_index_set or set())
 
         self.model_.eval()
@@ -502,8 +647,9 @@ class LSTMTemporalDetector(BaseDetector):
                 latent_mask_np = self._build_latent_mask_for_window(
                     window_indices=window_indices,
                     masked_index_set=dynamic_masked_index_set,
-                    latent_mask_pct=float(latent_mask_pct),
+                    latent_mask_pct=latent_mask_pct,
                     rng=rng,
+                    mask_target_timestep=bool(self.use_attention),
                 )
 
                 window_tensor = torch.from_numpy(window).unsqueeze(0).to(self.device)
@@ -523,16 +669,12 @@ class LSTMTemporalDetector(BaseDetector):
                 score = self._score_batch(target_tensor, reconstruction)
                 metrics[i] = float(score.item())
 
-                # Feed alarmed timesteps back as masked history for future windows.
                 if (
-                    mask_alarm_feedback
-                    and threshold_for_feedback is not None
+                    threshold_for_feedback is not None
                     and np.isfinite(metrics[i])
                     and metrics[i] > threshold_for_feedback
                 ):
                     dynamic_masked_index_set.add(int(i))
-
-        return metrics
 
     def process_time_series(
         self,
@@ -558,7 +700,6 @@ class LSTMTemporalDetector(BaseDetector):
                 "Threshold not set. Call set_threshold() or set_threshold_by_far() first."
             )
 
-        self.reset_alarms()
         scores = self.score_time_series(
             time_series,
             mask_indices=mask_indices,
@@ -569,11 +710,28 @@ class LSTMTemporalDetector(BaseDetector):
         )
         times = self._extract_timestamps(time_series)
 
+        self._aggregate_alarms_from_scores(
+            scores=scores,
+            times=times,
+            threshold=float(self.threshold),
+        )
+
+        return scores
+
+    def _aggregate_alarms_from_scores(
+        self,
+        scores: np.ndarray,
+        times: np.ndarray,
+        threshold: float,
+    ) -> None:
+        """Build detector alarm intervals from precomputed scores and timestamps."""
+        self.reset_alarms()
+
         for score, t in zip(scores, times):
             if np.isnan(score):
                 continue
 
-            if score > self.threshold:
+            if score > threshold:
                 if not self._is_alarming:
                     self._start_alarm(t, float(score))
                 else:
@@ -584,8 +742,6 @@ class LSTMTemporalDetector(BaseDetector):
 
         if self._is_alarming:
             self._end_alarm(float(times[-1]))
-
-        return scores
 
     def set_threshold_by_far(
         self,
@@ -668,13 +824,21 @@ class LSTMTemporalDetector(BaseDetector):
             test_threshold = (low_threshold + high_threshold) / 2
             self.threshold = test_threshold
 
-            self.process_time_series(
-                background_data,
-                mask_indices=mask_indices,
-                latent_mask_pct=latent_mask_pct,
-                mask_seed=mask_seed,
-                mask_alarm_feedback=mask_alarm_feedback,
-            )
+            if mask_alarm_feedback:
+                self.process_time_series(
+                    background_data,
+                    mask_indices=mask_indices,
+                    latent_mask_pct=latent_mask_pct,
+                    mask_seed=mask_seed,
+                    mask_alarm_feedback=mask_alarm_feedback,
+                )
+            else:
+                # No feedback dependency: threshold search can reuse precomputed scores.
+                self._aggregate_alarms_from_scores(
+                    scores=scores,
+                    times=times,
+                    threshold=float(test_threshold),
+                )
             n_alarms = len(self.alarms)
             observed_far = n_alarms / total_time_hours
 
@@ -715,13 +879,20 @@ class LSTMTemporalDetector(BaseDetector):
 
         self.threshold = best_threshold
 
-        self.process_time_series(
-            background_data,
-            mask_indices=mask_indices,
-            latent_mask_pct=latent_mask_pct,
-            mask_seed=mask_seed,
-            mask_alarm_feedback=mask_alarm_feedback,
-        )
+        if mask_alarm_feedback:
+            self.process_time_series(
+                background_data,
+                mask_indices=mask_indices,
+                latent_mask_pct=latent_mask_pct,
+                mask_seed=mask_seed,
+                mask_alarm_feedback=mask_alarm_feedback,
+            )
+        else:
+            self._aggregate_alarms_from_scores(
+                scores=scores,
+                times=times,
+                threshold=float(self.threshold),
+            )
         final_far = len(self.alarms) / total_time_hours
 
         if verbose:
@@ -745,6 +916,7 @@ class LSTMTemporalDetector(BaseDetector):
             lstm_hidden_dim=self.lstm_hidden_dim,
             lstm_layers=self.lstm_layers,
             dropout=self.dropout,
+            use_attention=self.use_attention,
         )
 
         payload = {
@@ -755,6 +927,7 @@ class LSTMTemporalDetector(BaseDetector):
             "loss_type": self.loss_type,
             "threshold": self.threshold,
             "aggregation_gap": self.aggregation_gap,
+            "use_attention": self.use_attention,
         }
 
         torch.save(payload, path)
@@ -772,6 +945,7 @@ class LSTMTemporalDetector(BaseDetector):
         self.loss_type = str(payload.get("loss_type", self.loss_type)).lower()
         self.threshold = payload.get("threshold", self.threshold)
         self.aggregation_gap = float(payload.get("aggregation_gap", self.aggregation_gap))
+        self.use_attention = bool(payload.get("use_attention", cfg.get("use_attention", self.use_attention)))
 
         self.n_bins_ = int(cfg["n_bins"])
         self.latent_dim = int(cfg["latent_dim"])
@@ -785,6 +959,7 @@ class LSTMTemporalDetector(BaseDetector):
             lstm_hidden_dim=self.lstm_hidden_dim,
             lstm_layers=self.lstm_layers,
             dropout=self.dropout,
+            use_attention=self.use_attention,
         ).to(self.device)
         self.model_.load_state_dict(payload["model_state"])
         self.model_.eval()
@@ -796,6 +971,7 @@ class LSTMTemporalDetector(BaseDetector):
         return (
             f"LSTMTemporalDetector(seq_len={self.seq_len}, "
             f"seq_stride={self.seq_stride}, "
+            f"use_attention={self.use_attention}, "
             f"loss_type='{self.loss_type}', "
             f"trained={self.is_trained}, alarms={len(self.alarms)})"
         )

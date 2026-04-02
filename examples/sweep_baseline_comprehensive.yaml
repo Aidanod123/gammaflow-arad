@@ -10,15 +10,18 @@ early_terminate:
   eta: 2
   s: 2
 
-run_cap: 50
+run_cap: 120
 
 parameters:
   preprocessed_dir:
-    value: preprocessed-data/no-sources-1.0-0.5-b256
+    values:
+      - preprocessed-data/no-sources-1.0-0.5
+      - preprocessed-data/no-sources-1.0-0.5-b256
+      - preprocessed-data/no-sources-1.0-0.5-b512
   epochs:
-    value: 40
+    value: 300
   batch_size:
-    value: 128
+    value: 512
   val_fraction:
     value: 0.2
   seed:
@@ -28,28 +31,30 @@ parameters:
   grad_clip_norm:
     value: 1.0
 
+  use_attention:
+    value: false
   loss_type:
     values: [jsd, chi2]
   seq_len:
-    values: [10, 20]
+    values: [10, 15, 20, 25]
+  seq_stride:
+    value: 1
   latent_dim:
-    values: [96, 128]
+    values: [32, 64, 96, 128, 192, 256, 384]
   lstm_hidden_dim:
-    values: [192, 256]
+    values: [96, 128, 192, 256, 384, 512]
   lstm_layers:
     values: [1, 2]
-  use_attention:
-    values: [false, true]
   dropout:
     values: [0.1, 0.2, 0.3]
   latent_mask_pct:
-    values: [0.0, 0.05, 0.1]
+    values: [0.0, 0.05, 0.1, 0.15, 0.2]
 
   learning_rate:
     distribution: log_uniform_values
-    min: 8.0e-5
-    max: 2.0e-3
+    min: 3.0e-5
+    max: 5.0e-3
   weight_decay:
     distribution: log_uniform_values
-    min: 1.0e-6
-    max: 1.0e-3
+    min: 1.0e-7
+    max: 5.0e-3
