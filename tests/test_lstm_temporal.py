@@ -127,7 +127,7 @@ def test_temporal_autoencoder_applies_mask_after_encoder() -> None:
 
     with torch.no_grad():
         b, s, _ = windows.shape
-        encoded = model.encoder(model._normalize_input(windows.reshape(b * s, model.n_bins)))
+        encoded = model.encoder(windows.reshape(b * s, model.n_bins).unsqueeze(1))
         encoded = encoded.view(b, s, model.latent_dim)
         assert torch.any(encoded[:, 1, :] != 0.0)
 
@@ -136,7 +136,7 @@ def test_temporal_autoencoder_applies_mask_after_encoder() -> None:
         decoder_latent = model.temporal_to_latent(temporal_out[:, -1, :])
         decoded_linear = model.decoder_linear(decoder_latent)
         decoded_linear = decoded_linear.view(b, 8, model.n_bins // 32)
-        expected = model.decoder(decoded_linear).view(b, model.n_bins)
+        expected = torch.softmax(model.decoder(decoded_linear).view(b, model.n_bins), dim=-1)
 
         observed = model(windows, latent_timestep_mask=timestep_mask)
 
@@ -162,7 +162,7 @@ def test_temporal_autoencoder_attention_masking_matches_manual() -> None:
 
     with torch.no_grad():
         b, s, _ = windows.shape
-        encoded = model.encoder(model._normalize_input(windows.reshape(b * s, model.n_bins)))
+        encoded = model.encoder(windows.reshape(b * s, model.n_bins).unsqueeze(1))
         encoded = encoded.view(b, s, model.latent_dim)
         masked_encoded = encoded.masked_fill(timestep_mask.unsqueeze(-1), 0.0)
         temporal_out, _ = model.temporal_core(masked_encoded)
@@ -177,7 +177,7 @@ def test_temporal_autoencoder_attention_masking_matches_manual() -> None:
         decoder_latent = model.temporal_to_latent(context)
         decoded_linear = model.decoder_linear(decoder_latent)
         decoded_linear = decoded_linear.view(b, 8, model.n_bins // 32)
-        expected = model.decoder(decoded_linear).view(b, model.n_bins)
+        expected = torch.softmax(model.decoder(decoded_linear).view(b, model.n_bins), dim=-1)
 
         observed = model(windows, latent_timestep_mask=timestep_mask)
 

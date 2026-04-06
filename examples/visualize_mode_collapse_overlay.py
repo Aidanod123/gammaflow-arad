@@ -11,7 +11,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -49,7 +49,7 @@ def _as_numpy_1d(value: object, length: int, default: float) -> np.ndarray:
     return arr
 
 
-def _load_run(path: Path) -> SpectralTimeSeries:
+def _load_run(path: Path) -> Tuple[Dict[str, Any], SpectralTimeSeries]:
     obj = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(obj, dict) or "spectra" not in obj:
         raise ValueError(f"Expected dict with 'spectra' in {path}")
@@ -80,24 +80,29 @@ def _load_run(path: Path) -> SpectralTimeSeries:
     if energy_edges is not None:
         energy_edges = np.asarray(energy_edges, dtype=np.float64)
 
-    return SpectralTimeSeries.from_array(
+    ts = SpectralTimeSeries.from_array(
         counts,
         energy_edges=energy_edges,
         timestamps=timestamps,
         live_times=live_times,
         real_times=real_times,
     )
+    return obj, ts
 
 
 def _to_target_scale_lstm(
     detector: LSTMTemporalDetector,
     target: np.ndarray,
     recon_raw: np.ndarray,
+    target_count_rate: Optional[float],
 ) -> np.ndarray:
     eps = 1e-8
     if detector.loss_type == "chi2":
-        max_val = float(np.max(target))
-        return recon_raw * (max_val + eps)
+        if target_count_rate is None:
+            raise ValueError("target_count_rate is required for chi2 LSTM reconstruction scaling")
+        recon_prob = np.maximum(np.asarray(recon_raw, dtype=np.float64), eps)
+        recon_prob = recon_prob / np.sum(recon_prob)
+        return recon_prob * float(target_count_rate)
 
     recon_sum = float(np.sum(recon_raw))
     target_sum = float(np.sum(target))
@@ -110,6 +115,7 @@ def _reconstruct_lstm_at_index(
     detector: LSTMTemporalDetector,
     counts: np.ndarray,
     idx: int,
+    target_count_rates: Optional[np.ndarray],
 ) -> Optional[np.ndarray]:
     window = detector._build_window_for_index(counts.astype(np.float32, copy=False), idx)
     if window is None:
@@ -122,7 +128,10 @@ def _reconstruct_lstm_at_index(
 
     recon_raw_np = recon_raw.detach().cpu().numpy().squeeze(0)
     target_np = target_tensor.detach().cpu().numpy().squeeze(0)
-    return _to_target_scale_lstm(detector, target_np, recon_raw_np)
+    target_scale = None
+    if target_count_rates is not None:
+        target_scale = float(target_count_rates[idx])
+    return _to_target_scale_lstm(detector, target_np, recon_raw_np, target_scale)
 
 
 def _spectrum_time(spec: Spectrum) -> float:
@@ -203,8 +212,32 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    ts = _load_run(args.run_file.resolve())
+    run_payload, ts = _load_run(args.run_file.resolve())
     counts = np.asarray(ts.counts, dtype=np.float32)
+    target_count_rates = np.sum(counts, axis=1).astype(np.float32, copy=False)
+    rates_value = run_payload.get("count_rates")
+    lt_value = run_payload.get("live_times")
+    if rates_value is not None and lt_value is not None:
+        if torch.is_tensor(rates_value):
+            rates_arr = rates_value.detach().cpu().numpy()
+        else:
+            rates_arr = np.asarray(rates_value)
+
+        if torch.is_tensor(lt_value):
+            lt_arr = lt_value.detach().cpu().numpy()
+        else:
+            lt_arr = np.asarray(lt_value)
+
+        if (
+            rates_arr.ndim == 1
+            and lt_arr.ndim == 1
+            and rates_arr.shape[0] == counts.shape[0]
+            and lt_arr.shape[0] == counts.shape[0]
+        ):
+            metadata_scales = rates_arr * lt_arr
+            finite_positive = np.isfinite(metadata_scales) & (metadata_scales > 0)
+            if bool(np.all(finite_positive)):
+                target_count_rates = np.asarray(metadata_scales, dtype=np.float32)
 
     lstm = LSTMTemporalDetector(device=args.device, verbose=False)
     lstm.load(str(args.lstm_model_path.resolve()))
@@ -212,7 +245,9 @@ def main() -> None:
     arad = ARADDetector(device=args.device, verbose=False)
     arad.load(str(args.arad_model_path.resolve()))
 
-    valid_lstm_indices = np.where(np.isfinite(lstm.score_time_series(ts)))[0]
+    valid_lstm_indices = np.where(
+        np.isfinite(lstm.score_time_series(ts, target_count_rates=target_count_rates))
+    )[0]
     indices = _select_random_indices(valid_lstm_indices, int(args.num_spectra), int(args.seed))
     if not indices:
         raise RuntimeError("No valid indices available for LSTM reconstruction")
@@ -221,7 +256,7 @@ def main() -> None:
     arad_curves: List[np.ndarray] = []
 
     for idx in indices:
-        lstm_recon = _reconstruct_lstm_at_index(lstm, counts, idx)
+        lstm_recon = _reconstruct_lstm_at_index(lstm, counts, idx, target_count_rates)
         if lstm_recon is None:
             continue
 

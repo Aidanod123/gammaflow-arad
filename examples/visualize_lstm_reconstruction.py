@@ -11,7 +11,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -48,7 +48,7 @@ def _as_numpy_1d(value: object, length: int, default: float) -> np.ndarray:
     return arr
 
 
-def _load_run(path: Path) -> SpectralTimeSeries:
+def _load_run(path: Path) -> Tuple[Dict[str, Any], SpectralTimeSeries]:
     obj = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(obj, dict) or "spectra" not in obj:
         raise ValueError(f"Expected dict with 'spectra' in {path}")
@@ -79,24 +79,29 @@ def _load_run(path: Path) -> SpectralTimeSeries:
     if energy_edges is not None:
         energy_edges = np.asarray(energy_edges, dtype=np.float64)
 
-    return SpectralTimeSeries.from_array(
+    ts = SpectralTimeSeries.from_array(
         counts,
         energy_edges=energy_edges,
         timestamps=timestamps,
         live_times=live_times,
         real_times=real_times,
     )
+    return obj, ts
 
 
 def _to_target_scale(
     detector: LSTMTemporalDetector,
     target: np.ndarray,
     recon_raw: np.ndarray,
+    target_count_rate: Optional[float],
 ) -> np.ndarray:
     eps = 1e-8
     if detector.loss_type == "chi2":
-        max_val = float(np.max(target))
-        return recon_raw * (max_val + eps)
+        if target_count_rate is None:
+            raise ValueError("target_count_rate is required for chi2 reconstruction scaling")
+        recon_prob = np.maximum(np.asarray(recon_raw, dtype=np.float64), eps)
+        recon_prob = recon_prob / np.sum(recon_prob)
+        return recon_prob * float(target_count_rate)
 
     # JSD is shape-based; scale reconstruction to target total for plotting.
     recon_sum = float(np.sum(recon_raw))
@@ -109,6 +114,7 @@ def _to_target_scale(
 def _score_and_reconstruct_at_index(
     detector: LSTMTemporalDetector,
     counts: np.ndarray,
+    target_count_rates: Optional[np.ndarray],
     idx: int,
     latent_mask_pct: float,
     mask_seed: Optional[int],
@@ -135,11 +141,21 @@ def _score_and_reconstruct_at_index(
             latent_mask_tensor = torch.from_numpy(latent_mask_np).unsqueeze(0).to(detector.device)
 
         recon_raw = detector.model_(window_tensor, latent_timestep_mask=latent_mask_tensor)
-        score_t = detector._score_batch(target_tensor, recon_raw)
+        scale_tensor = None
+        if target_count_rates is not None:
+            scale_tensor = torch.tensor(
+                [float(target_count_rates[idx])],
+                device=detector.device,
+                dtype=target_tensor.dtype,
+            )
+        score_t = detector._score_batch(target_tensor, recon_raw, target_scales=scale_tensor)
 
     recon_raw_np = recon_raw.detach().cpu().numpy().squeeze(0)
     target_np = counts[idx].astype(np.float32, copy=False)
-    recon_scaled = _to_target_scale(detector, target_np, recon_raw_np)
+    target_scale = None
+    if target_count_rates is not None:
+        target_scale = float(target_count_rates[idx])
+    recon_scaled = _to_target_scale(detector, target_np, recon_raw_np, target_scale)
 
     return float(score_t.item()), target_np, recon_scaled
 
@@ -161,8 +177,32 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    ts = _load_run(args.run_file)
+    run_payload, ts = _load_run(args.run_file)
     counts = np.asarray(ts.counts, dtype=np.float32)
+    target_count_rates = np.sum(counts, axis=1).astype(np.float32, copy=False)
+    rates_value = run_payload.get("count_rates")
+    lt_value = run_payload.get("live_times")
+    if rates_value is not None and lt_value is not None:
+        if torch.is_tensor(rates_value):
+            rates_arr = rates_value.detach().cpu().numpy()
+        else:
+            rates_arr = np.asarray(rates_value)
+
+        if torch.is_tensor(lt_value):
+            lt_arr = lt_value.detach().cpu().numpy()
+        else:
+            lt_arr = np.asarray(lt_value)
+
+        if (
+            rates_arr.ndim == 1
+            and lt_arr.ndim == 1
+            and rates_arr.shape[0] == counts.shape[0]
+            and lt_arr.shape[0] == counts.shape[0]
+        ):
+            metadata_scales = rates_arr * lt_arr
+            finite_positive = np.isfinite(metadata_scales) & (metadata_scales > 0)
+            if bool(np.all(finite_positive)):
+                target_count_rates = np.asarray(metadata_scales, dtype=np.float32)
 
     detector = LSTMTemporalDetector(device=args.device)
 
@@ -181,6 +221,7 @@ def main() -> None:
     else:
         scores = detector.score_time_series(
             ts,
+            target_count_rates=target_count_rates,
             latent_mask_pct=float(args.latent_mask_pct),
             mask_seed=args.latent_mask_seed,
         )
@@ -209,6 +250,7 @@ def main() -> None:
         out = _score_and_reconstruct_at_index(
             detector=detector,
             counts=counts,
+            target_count_rates=target_count_rates,
             idx=int(idx),
             latent_mask_pct=float(args.latent_mask_pct),
             mask_seed=args.latent_mask_seed,

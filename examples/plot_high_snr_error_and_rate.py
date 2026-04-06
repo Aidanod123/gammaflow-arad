@@ -348,11 +348,15 @@ def _score_run_lstm(
     device: str,
     latent_mask_pct: float,
     mask_seed: Optional[int],
+    target_count_rates: Optional[np.ndarray],
+    normalize_inputs_l1: bool,
 ) -> np.ndarray:
     detector = LSTMTemporalDetector(device=device, verbose=False)
     detector.load(str(model_path))
     return detector.score_time_series(
         ts,
+        target_count_rates=target_count_rates,
+        normalize_inputs_l1=bool(normalize_inputs_l1),
         latent_mask_pct=float(latent_mask_pct),
         mask_seed=mask_seed,
     )
@@ -423,6 +427,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--latent-mask-pct", type=float, default=0.0)
     parser.add_argument("--latent-mask-seed", type=int, default=None)
+    parser.add_argument(
+        "--normalize-inputs-l1",
+        action="store_true",
+        help="L1-normalize each spectrum at scoring time (leave off for already L1-preprocessed runs)",
+    )
     parser.add_argument("--run-ids", nargs="*", type=int, default=None)
     parser.add_argument(
         "--validation-runs-from-metrics",
@@ -504,12 +513,28 @@ def main() -> None:
         payload, ts = _load_run(run_path)
 
         if args.model_type == "lstm":
+            target_count_rates = payload.get("count_rates")
+            if target_count_rates is not None and torch.is_tensor(target_count_rates):
+                target_count_rates = target_count_rates.detach().cpu().numpy()
+            elif target_count_rates is not None:
+                target_count_rates = np.asarray(target_count_rates, dtype=np.float32)
+            if target_count_rates is not None:
+                live_times = payload.get("live_times")
+                if live_times is not None:
+                    if torch.is_tensor(live_times):
+                        live_times = live_times.detach().cpu().numpy()
+                    else:
+                        live_times = np.asarray(live_times, dtype=np.float32)
+                    target_count_rates = target_count_rates * live_times
+
             scores = _score_run_lstm(
                 model_path=args.model_path.resolve(),
                 ts=ts,
                 device=args.device,
                 latent_mask_pct=float(args.latent_mask_pct),
                 mask_seed=args.latent_mask_seed,
+                target_count_rates=target_count_rates,
+                normalize_inputs_l1=bool(args.normalize_inputs_l1),
             )
         else:
             scores = _score_run_arad(
@@ -585,6 +610,7 @@ def main() -> None:
             else None
         ),
         "source_lines_enabled": not bool(args.no_source_lines),
+        "normalize_inputs_l1": bool(args.normalize_inputs_l1),
         "num_runs": len(results),
         "runs": results,
     }

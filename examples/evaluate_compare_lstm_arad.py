@@ -368,6 +368,11 @@ def parse_args() -> argparse.Namespace:
         default="cuda",
         help="Device for PyTorch models",
     )
+    parser.add_argument(
+        "--normalize-inputs-l1",
+        action="store_true",
+        help="L1-normalize each spectrum at LSTM scoring time",
+    )
     return parser.parse_args()
 
 
@@ -393,7 +398,36 @@ def main() -> None:
     arad.load(str(args.arad_model_path.resolve()))
 
     counts = np.asarray(ts.counts, dtype=np.float32)
-    lstm_scores = lstm.score_time_series(ts)
+    target_count_rates = np.sum(counts, axis=1).astype(np.float32, copy=False)
+    rates_value = run_payload.get("count_rates")
+    lt_value = run_payload.get("live_times")
+    if rates_value is not None and lt_value is not None:
+        if torch.is_tensor(rates_value):
+            rates_arr = rates_value.detach().cpu().numpy()
+        else:
+            rates_arr = np.asarray(rates_value)
+
+        if torch.is_tensor(lt_value):
+            lt_arr = lt_value.detach().cpu().numpy()
+        else:
+            lt_arr = np.asarray(lt_value)
+
+        if (
+            rates_arr.ndim == 1
+            and lt_arr.ndim == 1
+            and rates_arr.shape[0] == counts.shape[0]
+            and lt_arr.shape[0] == counts.shape[0]
+        ):
+            metadata_scales = rates_arr * lt_arr
+            finite_positive = np.isfinite(metadata_scales) & (metadata_scales > 0)
+            if bool(np.all(finite_positive)):
+                target_count_rates = np.asarray(metadata_scales, dtype=np.float32)
+
+    lstm_scores = lstm.score_time_series(
+        ts,
+        target_count_rates=target_count_rates,
+        normalize_inputs_l1=bool(args.normalize_inputs_l1),
+    )
     arad_scores = np.asarray([arad.score_spectrum(ts[i]) for i in range(ts.n_spectra)], dtype=np.float64)
 
     labels: Optional[np.ndarray] = None
@@ -458,6 +492,7 @@ def main() -> None:
         "arad_model_path": str(args.arad_model_path.resolve()),
         "h5_path": str(h5_path) if h5_path is not None else None,
         "time_units": args.time_units,
+        "normalize_inputs_l1": bool(args.normalize_inputs_l1),
         "selected_random_indices": selected_indices,
         "score_table_path": str(score_table_path.resolve()),
         "score_stats": {

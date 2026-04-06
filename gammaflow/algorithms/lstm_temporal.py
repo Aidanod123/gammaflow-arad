@@ -40,10 +40,11 @@ def _score_batch_fn(
     targets: "torch.Tensor",
     recon: "torch.Tensor",
     loss_type: str,
+    target_scales: Optional["torch.Tensor"] = None,
 ) -> "torch.Tensor":
     """Lazy wrapper that imports from training.losses on first call."""
     from gammaflow.training.losses import score_batch  # noqa: deferred to avoid circular import
-    return score_batch(targets, recon, loss_type)
+    return score_batch(targets, recon, loss_type, target_scales=target_scales)
 
 
 @dataclass
@@ -150,13 +151,6 @@ class TemporalLSTMAutoencoder(nn.Module):
             if module.bias is not None:
                 nn.init.constant_(module.bias, 0.01)
 
-    def _normalize_input(self, x: torch.Tensor) -> torch.Tensor:
-        """Normalize spectra by per-sample max and add channel dimension."""
-        eps = 1e-8
-        max_val = torch.max(x, dim=1, keepdim=True).values
-        normalized_x = x / (max_val + eps)
-        return normalized_x.unsqueeze(1)
-
     def forward(
         self,
         windows: torch.Tensor,
@@ -175,8 +169,7 @@ class TemporalLSTMAutoencoder(nn.Module):
         """
         batch_size, seq_len, _ = windows.shape
         flat_windows = windows.reshape(batch_size * seq_len, self.n_bins)
-        normalized_windows = self._normalize_input(flat_windows)
-        encoded_flat = self.encoder(normalized_windows)
+        encoded_flat = self.encoder(flat_windows.unsqueeze(1))
         encoded = encoded_flat.view(batch_size, seq_len, self.latent_dim)
 
         if latent_timestep_mask is not None:
@@ -401,9 +394,19 @@ class LSTMTemporalDetector(BaseDetector):
             "Use process_time_series(...) instead of score_spectrum(...)."
         )
 
-    def _score_batch(self, targets: torch.Tensor, recon: torch.Tensor) -> torch.Tensor:
+    def _score_batch(
+        self,
+        targets: torch.Tensor,
+        recon: torch.Tensor,
+        target_scales: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Per-sample anomaly scores.  Delegates to ``gammaflow.training.losses``."""
-        return _score_batch_fn(targets, recon, self.loss_type)
+        return _score_batch_fn(
+            targets,
+            recon,
+            self.loss_type,
+            target_scales=target_scales,
+        )
 
     def _window_indices_for_end(self, end_idx: int) -> Optional[np.ndarray]:
         offsets = np.arange(self.seq_len - 1, -1, -1, dtype=int) * self.seq_stride
@@ -454,6 +457,8 @@ class LSTMTemporalDetector(BaseDetector):
     def score_time_series(
         self,
         time_series,
+        target_count_rates: Optional[Sequence[float]] = None,
+        normalize_inputs_l1: bool = False,
         mask_indices: Optional[Sequence[int]] = None,
         latent_mask_pct: float = 0.0,
         mask_seed: Optional[int] = None,
@@ -492,6 +497,9 @@ class LSTMTemporalDetector(BaseDetector):
             ``self.threshold``.
         inference_batch_size : int
             Number of windows per forward pass when using the batched path.
+        normalize_inputs_l1 : bool
+            If True, L1-normalize each input spectrum before building windows.
+            Keep False when the preprocessed inputs are already L1-normalized.
         """
         if not self.is_trained:
             raise RuntimeError(
@@ -520,6 +528,26 @@ class LSTMTemporalDetector(BaseDetector):
                 f"Time series has {counts.shape[1]} bins, expected {self.n_bins_}."
             )
 
+        if bool(normalize_inputs_l1):
+            counts_row_sums = np.sum(counts, axis=1, keepdims=True)
+            counts_row_sums = np.maximum(counts_row_sums, 1e-10)
+            counts = counts / counts_row_sums
+
+        if self.loss_type == "chi2" and target_count_rates is None:
+            raise ValueError(
+                "target_count_rates are required for chi2 scoring. "
+                "Pass one scalar per spectrum aligned with the input time series."
+            )
+
+        count_rate_array: Optional[np.ndarray] = None
+        if target_count_rates is not None:
+            count_rate_array = np.asarray(target_count_rates, dtype=np.float32)
+            if count_rate_array.ndim != 1 or count_rate_array.shape[0] != counts.shape[0]:
+                raise ValueError(
+                    "target_count_rates must have shape (n_spectra,), "
+                    f"got {count_rate_array.shape} for {counts.shape[0]} spectra"
+                )
+
         metrics = np.full(counts.shape[0], np.nan, dtype=float)
 
         masked_index_set: Optional[Set[int]] = None
@@ -531,6 +559,7 @@ class LSTMTemporalDetector(BaseDetector):
                 counts=counts,
                 metrics=metrics,
                 masked_index_set=masked_index_set,
+                target_count_rates=count_rate_array,
                 latent_mask_pct=float(latent_mask_pct),
                 mask_seed=mask_seed,
                 threshold_for_feedback=threshold_for_feedback,
@@ -540,6 +569,7 @@ class LSTMTemporalDetector(BaseDetector):
                 counts=counts,
                 metrics=metrics,
                 masked_index_set=masked_index_set,
+                target_count_rates=count_rate_array,
                 latent_mask_pct=float(latent_mask_pct),
                 mask_seed=mask_seed,
                 batch_size=max(1, int(inference_batch_size)),
@@ -556,6 +586,7 @@ class LSTMTemporalDetector(BaseDetector):
         counts: np.ndarray,
         metrics: np.ndarray,
         masked_index_set: Optional[Set[int]],
+        target_count_rates: Optional[np.ndarray],
         latent_mask_pct: float,
         mask_seed: Optional[int],
         batch_size: int,
@@ -590,6 +621,7 @@ class LSTMTemporalDetector(BaseDetector):
 
         all_windows = np.stack(windows_list)              # (N, seq_len, n_bins)
         all_targets = counts[valid_indices]                # (N, n_bins)
+        all_target_scales = None if target_count_rates is None else target_count_rates[valid_indices]
 
         has_any_mask = any(m is not None for m in masks_list)
         all_masks: Optional[np.ndarray] = None
@@ -607,13 +639,16 @@ class LSTMTemporalDetector(BaseDetector):
 
                 win_t = torch.from_numpy(all_windows[start:end]).to(self.device)
                 tgt_t = torch.from_numpy(all_targets[start:end]).to(self.device)
+                scale_t = None
+                if all_target_scales is not None:
+                    scale_t = torch.from_numpy(all_target_scales[start:end]).to(self.device)
 
                 mask_t = None
                 if all_masks is not None:
                     mask_t = torch.from_numpy(all_masks[start:end]).to(self.device)
 
                 recon = self.model_(win_t, latent_timestep_mask=mask_t)
-                scores = self._score_batch(tgt_t, recon)
+                scores = self._score_batch(tgt_t, recon, target_scales=scale_t)
                 scores_np = scores.cpu().numpy()
 
                 for j, idx in enumerate(valid_indices[start:end]):
@@ -628,6 +663,7 @@ class LSTMTemporalDetector(BaseDetector):
         counts: np.ndarray,
         metrics: np.ndarray,
         masked_index_set: Optional[Set[int]],
+        target_count_rates: Optional[np.ndarray],
         latent_mask_pct: float,
         mask_seed: Optional[int],
         threshold_for_feedback: Optional[float],
@@ -654,6 +690,13 @@ class LSTMTemporalDetector(BaseDetector):
 
                 window_tensor = torch.from_numpy(window).unsqueeze(0).to(self.device)
                 target_tensor = torch.from_numpy(counts[i]).unsqueeze(0).to(self.device)
+                scale_tensor = None
+                if target_count_rates is not None:
+                    scale_tensor = torch.tensor(
+                        [float(target_count_rates[i])],
+                        device=self.device,
+                        dtype=target_tensor.dtype,
+                    )
                 latent_mask_tensor = None
                 if latent_mask_np is not None:
                     latent_mask_tensor = (
@@ -666,7 +709,11 @@ class LSTMTemporalDetector(BaseDetector):
                     window_tensor,
                     latent_timestep_mask=latent_mask_tensor,
                 )
-                score = self._score_batch(target_tensor, reconstruction)
+                score = self._score_batch(
+                    target_tensor,
+                    reconstruction,
+                    target_scales=scale_tensor,
+                )
                 metrics[i] = float(score.item())
 
                 if (
@@ -679,6 +726,8 @@ class LSTMTemporalDetector(BaseDetector):
     def process_time_series(
         self,
         time_series,
+        target_count_rates: Optional[Sequence[float]] = None,
+        normalize_inputs_l1: bool = False,
         mask_indices: Optional[Sequence[int]] = None,
         latent_mask_pct: float = 0.0,
         mask_seed: Optional[int] = None,
@@ -702,6 +751,8 @@ class LSTMTemporalDetector(BaseDetector):
 
         scores = self.score_time_series(
             time_series,
+            target_count_rates=target_count_rates,
+            normalize_inputs_l1=normalize_inputs_l1,
             mask_indices=mask_indices,
             latent_mask_pct=latent_mask_pct,
             mask_seed=mask_seed,
@@ -749,6 +800,8 @@ class LSTMTemporalDetector(BaseDetector):
         alarms_per_hour: float = 1.0,
         max_iterations: int = 20,
         verbose: bool = False,
+        target_count_rates: Optional[Sequence[float]] = None,
+        normalize_inputs_l1: bool = False,
         mask_indices: Optional[Sequence[int]] = None,
         latent_mask_pct: float = 0.0,
         mask_seed: Optional[int] = None,
@@ -764,6 +817,8 @@ class LSTMTemporalDetector(BaseDetector):
         bootstrap_feedback = bool(mask_alarm_feedback and self.threshold is not None)
         scores = self.score_time_series(
             background_data,
+            target_count_rates=target_count_rates,
+            normalize_inputs_l1=normalize_inputs_l1,
             mask_indices=mask_indices,
             latent_mask_pct=latent_mask_pct,
             mask_seed=mask_seed,
@@ -827,6 +882,8 @@ class LSTMTemporalDetector(BaseDetector):
             if mask_alarm_feedback:
                 self.process_time_series(
                     background_data,
+                    target_count_rates=target_count_rates,
+                    normalize_inputs_l1=normalize_inputs_l1,
                     mask_indices=mask_indices,
                     latent_mask_pct=latent_mask_pct,
                     mask_seed=mask_seed,

@@ -1,29 +1,8 @@
 """Shared loss and scoring functions for spectral reconstruction models.
 
-Normalization summary
----------------------
-These functions assume the following data flow:
-
-1. **Input spectra** are already L1-normalized (sum to 1.0 per sample) before
-   entering the model.
-2. The model's encoder applies **Linf normalization** (divide by per-sample max)
-   inside ``_normalize_input``, so the peak bin becomes ~1.0.
-3. The decoder's final layer uses **Sigmoid**, producing values in [0, 1].
-
-Scoring / loss then operates as follows:
-
-* **JSD**: Both target and reconstruction are re-normalized to valid probability
-  distributions via ``normalize_prob`` (L1 norm + clamp).  Because the target is
-  already L1-normalized this is nearly a no-op for the target; for the sigmoid
-  reconstruction it converts to a proper distribution before computing
-  Jensen-Shannon divergence.
-
-* **Chi-squared**: The sigmoid reconstruction is *denormalized* by multiplying
-  by ``max(target)`` to approximately undo the Linf step, then a Pearson
-  chi-squared statistic is computed against the raw target.
-
-All functions return **per-sample** values (shape ``(batch,)``).  Training code
-should call ``.mean()`` on the result to get a scalar loss for back-propagation.
+JSD is computed on probability-normalized spectra, while chi-squared can be
+computed in a physical domain by de-normalizing both target and reconstruction
+using per-spectrum scale factors (for example, gross ``count_rates``).
 """
 
 from __future__ import annotations
@@ -58,19 +37,50 @@ def jsd_per_sample(target: torch.Tensor, recon: torch.Tensor) -> torch.Tensor:
     return torch.sqrt(0.5 * (kld_pm + kld_qm))
 
 
-def chi2_per_sample(target: torch.Tensor, recon: torch.Tensor) -> torch.Tensor:
+def _resolve_target_scales(
+    target: torch.Tensor,
+    target_scales: torch.Tensor | None,
+    eps: float,
+) -> torch.Tensor:
+    """Return shape ``(batch, 1)`` scale factors for chi2 de-normalization."""
+    if target_scales is None:
+        return torch.clamp(target.sum(dim=-1, keepdim=True), min=eps)
+
+    scales = target_scales
+    if scales.dim() == 1:
+        scales = scales.unsqueeze(-1)
+    if scales.dim() != 2 or scales.shape[1] != 1:
+        raise ValueError(
+            "target_scales must have shape (batch,) or (batch, 1), "
+            f"got {tuple(target_scales.shape)}"
+        )
+    if scales.shape[0] != target.shape[0]:
+        raise ValueError(
+            "target_scales batch dimension must match target batch dimension, "
+            f"got {scales.shape[0]} and {target.shape[0]}"
+        )
+    return torch.clamp(scales.to(device=target.device, dtype=target.dtype), min=eps)
+
+
+def chi2_per_sample(
+    target: torch.Tensor,
+    recon: torch.Tensor,
+    target_scales: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Per-sample chi-squared score between target and reconstruction.
 
-    The sigmoid reconstruction is denormalized by ``max(target)`` before
-    computing the statistic.
+    Both target and reconstruction are first L1-normalized to probability
+    vectors, then de-normalized with per-sample scales before computing the
+    Pearson chi-squared statistic.
 
     Returns shape ``(batch,)``.
     """
-    eps = 1e-8
-    max_vals = torch.max(target, dim=1, keepdim=True).values
-    recon_denorm = recon * (max_vals + eps)
+    eps = 1e-3
+    scale = _resolve_target_scales(target, target_scales, eps)
+    target_denorm = normalize_prob(target) * scale
+    recon_denorm = normalize_prob(recon) * scale
     recon_denorm = torch.clamp(recon_denorm, min=eps)
-    return torch.sum((target - recon_denorm) ** 2 / recon_denorm, dim=-1)
+    return torch.sum((target_denorm - recon_denorm) ** 2 / recon_denorm, dim=-1)
 
 
 def jsd_loss(target: torch.Tensor, recon: torch.Tensor) -> torch.Tensor:
@@ -78,9 +88,13 @@ def jsd_loss(target: torch.Tensor, recon: torch.Tensor) -> torch.Tensor:
     return jsd_per_sample(target, recon).mean()
 
 
-def chi2_loss(target: torch.Tensor, recon: torch.Tensor) -> torch.Tensor:
+def chi2_loss(
+    target: torch.Tensor,
+    recon: torch.Tensor,
+    target_scales: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Mean chi-squared loss for training (scalar)."""
-    return chi2_per_sample(target, recon).mean()
+    return chi2_per_sample(target, recon, target_scales=target_scales).mean()
 
 
 def get_loss_fn(loss_name: str):
@@ -102,6 +116,7 @@ def score_batch(
     targets: torch.Tensor,
     recon: torch.Tensor,
     loss_type: str,
+    target_scales: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Per-sample anomaly scores for inference.
 
@@ -110,5 +125,5 @@ def score_batch(
     if loss_type == "jsd":
         return jsd_per_sample(targets, recon)
     if loss_type == "chi2":
-        return chi2_per_sample(targets, recon)
+        return chi2_per_sample(targets, recon, target_scales=target_scales)
     raise ValueError(f"Unsupported loss_type '{loss_type}' for scoring")

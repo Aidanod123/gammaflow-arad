@@ -45,10 +45,12 @@ class RunIndexEntry:
 class PreprocessedTemporalWindowDataset(Dataset):
     """Map-style dataset that serves causal windows from preprocessed run files.
 
-    Each sample is a tuple ``(window, target)`` where:
+    Each sample is a tuple ``(window, target, target_scale)`` where:
     - ``window`` has shape ``(seq_len, n_bins)``
     - ``target`` has shape ``(n_bins,)`` and corresponds to the final spectrum
       in the window.
+    - ``target_scale`` is a scalar used to de-normalize target/recon for
+      physical-domain chi-squared scoring.
     """
 
     def __init__(
@@ -72,13 +74,13 @@ class PreprocessedTemporalWindowDataset(Dataset):
 
         self._entries: List[RunIndexEntry] = []
         self._cumulative_windows: List[int] = []
-        self._cache: "OrderedDict[Path, np.ndarray]" = OrderedDict()
+        self._cache: "OrderedDict[Path, Tuple[np.ndarray, np.ndarray]]" = OrderedDict()
 
         total = 0
         inferred_n_bins: Optional[int] = None
 
         for run_path in run_files:
-            spectra = self._load_spectra(run_path)
+            spectra, _ = self._load_run_arrays(run_path)
             n_spectra, n_bins = spectra.shape
 
             if inferred_n_bins is None:
@@ -98,11 +100,10 @@ class PreprocessedTemporalWindowDataset(Dataset):
         self.n_bins = int(inferred_n_bins) if inferred_n_bins is not None else 0
 
     @staticmethod
-    def _load_spectra(path: Path) -> np.ndarray:
+    def _load_run_arrays(path: Path) -> Tuple[np.ndarray, np.ndarray]:
         obj = torch.load(path, map_location="cpu", weights_only=False)
         if not isinstance(obj, dict) or "spectra" not in obj:
             raise ValueError(f"Expected dict with 'spectra' in {path}")
-
         spectra = obj["spectra"]
         if torch.is_tensor(spectra):
             arr = spectra.detach().cpu().numpy()
@@ -112,7 +113,42 @@ class PreprocessedTemporalWindowDataset(Dataset):
         if arr.ndim != 2:
             raise ValueError(f"spectra in {path} must have shape (n_spectra, n_bins), got {arr.shape}")
 
-        return arr.astype(np.float32, copy=False)
+        # Preferred chi2 scale is total counts represented by each target spectrum.
+        # This preserves units for Pearson chi-squared regardless of auxiliary
+        # metadata availability.
+        scales_arr = np.sum(arr, axis=1)
+
+        # If metadata contains both count_rates and live_times, prefer their
+        # product when valid as an explicit total-count estimate.
+        if "count_rates" in obj and "live_times" in obj:
+            count_rates = obj["count_rates"]
+            live_times = obj["live_times"]
+
+            if torch.is_tensor(count_rates):
+                rates_arr = count_rates.detach().cpu().numpy()
+            else:
+                rates_arr = np.asarray(count_rates)
+
+            if torch.is_tensor(live_times):
+                live_times_arr = live_times.detach().cpu().numpy()
+            else:
+                live_times_arr = np.asarray(live_times)
+
+            if (
+                rates_arr.ndim == 1
+                and live_times_arr.ndim == 1
+                and rates_arr.shape[0] == arr.shape[0]
+                and live_times_arr.shape[0] == arr.shape[0]
+            ):
+                metadata_scales = rates_arr * live_times_arr
+                finite_positive = np.isfinite(metadata_scales) & (metadata_scales > 0)
+                if bool(np.all(finite_positive)):
+                    scales_arr = metadata_scales
+
+        return (
+            arr.astype(np.float32, copy=False),
+            np.asarray(scales_arr, dtype=np.float32),
+        )
 
     def __len__(self) -> int:
         return self._cumulative_windows[-1] if self._cumulative_windows else 0
@@ -128,22 +164,22 @@ class PreprocessedTemporalWindowDataset(Dataset):
         local_idx = idx - prev_cum
         return run_idx, local_idx
 
-    def _get_cached_spectra(self, run_idx: int) -> np.ndarray:
+    def _get_cached_spectra(self, run_idx: int) -> Tuple[np.ndarray, np.ndarray]:
         path = self._entries[run_idx].path
         cached = self._cache.get(path)
         if cached is not None:
             self._cache.move_to_end(path)
             return cached
 
-        spectra = self._load_spectra(path)
-        self._cache[path] = spectra
+        run_arrays = self._load_run_arrays(path)
+        self._cache[path] = run_arrays
         if len(self._cache) > self.cache_size:
             self._cache.popitem(last=False)
-        return spectra
+        return run_arrays
 
     def __getitem__(self, idx: int):
         run_idx, local_window_idx = self._resolve_index(idx)
-        spectra = self._get_cached_spectra(run_idx)
+        spectra, target_scales = self._get_cached_spectra(run_idx)
 
         end_idx = self.warmup + local_window_idx
         offsets = np.arange(self.seq_len - 1, -1, -1, dtype=int) * self.seq_stride
@@ -151,8 +187,13 @@ class PreprocessedTemporalWindowDataset(Dataset):
 
         window = spectra[indices]
         target = spectra[end_idx]
+        target_scale = np.float32(target_scales[end_idx])
 
-        return torch.from_numpy(window), torch.from_numpy(target)
+        return (
+            torch.from_numpy(window),
+            torch.from_numpy(target),
+            torch.tensor(target_scale, dtype=torch.float32),
+        )
 
 
 @dataclass
@@ -458,9 +499,10 @@ def train_lstm_temporal_from_preprocessed(
         train_loss_sum = 0.0
         train_items = 0
 
-        for windows, targets in bundles.train_loader:
+        for windows, targets, target_scales in bundles.train_loader:
             windows = windows.to(detector.device)
             targets = targets.to(detector.device)
+            target_scales = target_scales.to(detector.device)
             latent_mask = _sample_history_latent_mask(
                 batch_size=int(windows.shape[0]),
                 seq_len=int(windows.shape[1]),
@@ -472,7 +514,10 @@ def train_lstm_temporal_from_preprocessed(
 
             optimizer.zero_grad(set_to_none=True)
             recon = model(windows, latent_timestep_mask=latent_mask)
-            loss = loss_fn(targets, recon)
+            if str(loss_type).lower() == "chi2":
+                loss = loss_fn(targets, recon, target_scales=target_scales)
+            else:
+                loss = loss_fn(targets, recon)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip_norm)
             optimizer.step()
@@ -490,9 +535,10 @@ def train_lstm_temporal_from_preprocessed(
         # the number of training batches that ran before this point.
         val_mask_rng = np.random.default_rng(mask_rng_seed + epoch)
         with torch.no_grad():
-            for windows, targets in bundles.val_loader:
+            for windows, targets, target_scales in bundles.val_loader:
                 windows = windows.to(detector.device)
                 targets = targets.to(detector.device)
+                target_scales = target_scales.to(detector.device)
                 latent_mask = _sample_history_latent_mask(
                     batch_size=int(windows.shape[0]),
                     seq_len=int(windows.shape[1]),
@@ -502,7 +548,10 @@ def train_lstm_temporal_from_preprocessed(
                     mask_target_timestep=bool(use_attention),
                 )
                 recon = model(windows, latent_timestep_mask=latent_mask)
-                loss = loss_fn(targets, recon)
+                if str(loss_type).lower() == "chi2":
+                    loss = loss_fn(targets, recon, target_scales=target_scales)
+                else:
+                    loss = loss_fn(targets, recon)
                 batch_size_actual = int(windows.shape[0])
                 val_loss_sum += float(loss.item()) * batch_size_actual
                 val_items += batch_size_actual

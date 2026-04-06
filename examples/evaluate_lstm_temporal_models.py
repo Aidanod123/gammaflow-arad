@@ -197,6 +197,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--normalize-inputs-l1",
+        action="store_true",
+        help="L1-normalize each spectrum at scoring time",
+    )
+    parser.add_argument(
         "--max-runs",
         type=int,
         default=None,
@@ -438,6 +443,51 @@ def _build_concatenated_time_series(runs: Sequence[RunData]) -> SpectralTimeSeri
         live_times=live_times,
         real_times=real_times,
     )
+
+
+def _build_target_scales_for_runs(runs: Sequence[RunData]) -> np.ndarray:
+    """Build per-spectrum chi2 target scales aligned with concatenated runs.
+
+    Preferred scale is total counts from each spectrum. If both ``count_rates``
+    and ``live_times`` metadata are present and valid for a run, use
+    ``count_rates * live_times`` for that run.
+    """
+    scale_parts: List[np.ndarray] = []
+
+    for run in runs:
+        counts = np.asarray(run.time_series.counts, dtype=np.float64)
+        run_scales = np.sum(counts, axis=1)
+
+        rates_value = run.payload.get("count_rates")
+        lt_value = run.payload.get("live_times")
+        if rates_value is not None and lt_value is not None:
+            if torch.is_tensor(rates_value):
+                rates_arr = rates_value.detach().cpu().numpy()
+            else:
+                rates_arr = np.asarray(rates_value)
+
+            if torch.is_tensor(lt_value):
+                lt_arr = lt_value.detach().cpu().numpy()
+            else:
+                lt_arr = np.asarray(lt_value)
+
+            if (
+                rates_arr.ndim == 1
+                and lt_arr.ndim == 1
+                and rates_arr.shape[0] == counts.shape[0]
+                and lt_arr.shape[0] == counts.shape[0]
+            ):
+                metadata_scales = rates_arr * lt_arr
+                finite_positive = np.isfinite(metadata_scales) & (metadata_scales > 0)
+                if bool(np.all(finite_positive)):
+                    run_scales = metadata_scales
+
+        scale_parts.append(np.asarray(run_scales, dtype=np.float32))
+
+    if not scale_parts:
+        return np.asarray([], dtype=np.float32)
+
+    return np.concatenate(scale_parts, axis=0)
 
 
 def _safe_stats(values: np.ndarray) -> Dict[str, float]:
@@ -866,6 +916,7 @@ def evaluate_model(
     latent_mask_seed: Optional[int],
     explicit_mask_map: Dict[str, List[int]],
     mask_alarm_feedback: bool,
+    normalize_inputs_l1: bool,
     gt_score_run_name: Optional[str],
     gt_scores_output_path: Optional[Path],
 ) -> Dict[str, object]:
@@ -881,6 +932,7 @@ def evaluate_model(
 
     for run in eval_runs:
         ts = run.time_series
+        target_scales = _build_target_scales_for_runs([run])
         run_mask_indices = _resolve_run_mask_indices(explicit_mask_map, run)
         run_mask_seed = latent_mask_seed
         if run_mask_seed is not None and run.run_id is not None:
@@ -888,6 +940,8 @@ def evaluate_model(
 
         scores = detector.process_time_series(
             ts,
+            target_count_rates=target_scales,
+            normalize_inputs_l1=bool(normalize_inputs_l1),
             mask_indices=run_mask_indices,
             latent_mask_pct=float(latent_mask_pct),
             mask_seed=run_mask_seed,
@@ -915,6 +969,7 @@ def evaluate_model(
                 "latent_mask_seed": run_mask_seed,
                 "explicit_mask_count": int(len(run_mask_indices or [])),
                 "mask_alarm_feedback": bool(mask_alarm_feedback),
+                "normalize_inputs_l1": bool(normalize_inputs_l1),
                 "use_attention": bool(detector.use_attention),
             },
         }
@@ -1153,6 +1208,7 @@ def main() -> None:
             )
             cal_runs = [_load_run_data(p) for p in model_cal_files]
             cal_ts = _build_concatenated_time_series(cal_runs)
+            cal_target_scales = _build_target_scales_for_runs(cal_runs)
 
             detector = LSTMTemporalDetector(verbose=not args.quiet)
             detector.load(str(model_path))
@@ -1160,6 +1216,8 @@ def main() -> None:
                 cal_ts,
                 alarms_per_hour=float(args.alarms_per_hour),
                 verbose=not args.quiet,
+                target_count_rates=cal_target_scales,
+                normalize_inputs_l1=bool(args.normalize_inputs_l1),
                 latent_mask_pct=float(args.latent_mask_pct),
                 mask_seed=args.latent_mask_seed,
                 mask_alarm_feedback=bool(args.mask_alarm_feedback),
@@ -1195,6 +1253,7 @@ def main() -> None:
             latent_mask_seed=args.latent_mask_seed,
             explicit_mask_map=explicit_mask_map,
             mask_alarm_feedback=bool(args.mask_alarm_feedback),
+            normalize_inputs_l1=bool(args.normalize_inputs_l1),
             gt_score_run_name=(gt_score_run.run_name if gt_score_run is not None else None),
             gt_scores_output_path=(
                 output_dir / f"{model_path.stem}.{Path(gt_score_run.run_name).stem}.ground_truth_scores.json"
@@ -1283,6 +1342,7 @@ def main() -> None:
         "latent_mask_seed": args.latent_mask_seed,
         "latent_mask_file": str(explicit_mask_path) if explicit_mask_path else None,
         "mask_alarm_feedback": bool(args.mask_alarm_feedback),
+        "normalize_inputs_l1": bool(args.normalize_inputs_l1),
         "results": all_results,
     }
 
