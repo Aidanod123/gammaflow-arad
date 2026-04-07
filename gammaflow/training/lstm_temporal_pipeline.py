@@ -343,7 +343,8 @@ def train_lstm_temporal_from_preprocessed(
     lstm_hidden_dim: int = 128,
     lstm_layers: int = 2,
     dropout: float = 0.2,
-    use_attention: bool = False,
+    mask_target: bool = True,
+    use_attention: Optional[bool] = None,
     loss_type: str = "jsd",
     learning_rate: float = 1e-3,
     weight_decay: float = 1e-5,
@@ -377,6 +378,12 @@ def train_lstm_temporal_from_preprocessed(
 
     if not (0.0 <= float(latent_mask_pct) <= 1.0):
         raise ValueError(f"latent_mask_pct must be in [0, 1], got {latent_mask_pct}")
+    if use_attention is not None and bool(use_attention):
+        # Backward compatibility with older call sites that used attention.
+        # Attention is removed; preserve closest legacy behavior by ensuring
+        # the target timestep is masked.
+        mask_target = True
+    mask_target = bool(mask_target)
     if int(epochs) < 1:
         raise ValueError(f"epochs must be >= 1, got {epochs}")
     if int(min_epochs) < 1:
@@ -442,7 +449,7 @@ def train_lstm_temporal_from_preprocessed(
         lstm_hidden_dim=lstm_hidden_dim,
         lstm_layers=lstm_layers,
         dropout=dropout,
-        use_attention=use_attention,
+        mask_target=mask_target,
         loss_type=loss_type,
         threshold=None,
         device=device,
@@ -509,7 +516,7 @@ def train_lstm_temporal_from_preprocessed(
                 latent_mask_pct=float(latent_mask_pct),
                 rng=train_mask_rng,
                 device=detector.device,
-                mask_target_timestep=bool(use_attention),
+                mask_target_timestep=mask_target,
             )
 
             optimizer.zero_grad(set_to_none=True)
@@ -531,9 +538,9 @@ def train_lstm_temporal_from_preprocessed(
         model.eval()
         val_loss_sum = 0.0
         val_items = 0
-        # Fresh RNG per epoch so val masks are deterministic regardless of
-        # the number of training batches that ran before this point.
-        val_mask_rng = np.random.default_rng(mask_rng_seed + epoch)
+        # Reset RNG with the same seed each epoch so validation masking is
+        # identical across epochs.
+        val_mask_rng = np.random.default_rng(mask_rng_seed)
         with torch.no_grad():
             for windows, targets, target_scales in bundles.val_loader:
                 windows = windows.to(detector.device)
@@ -545,7 +552,7 @@ def train_lstm_temporal_from_preprocessed(
                     latent_mask_pct=float(latent_mask_pct),
                     rng=val_mask_rng,
                     device=detector.device,
-                    mask_target_timestep=bool(use_attention),
+                    mask_target_timestep=mask_target,
                 )
                 recon = model(windows, latent_timestep_mask=latent_mask)
                 if str(loss_type).lower() == "chi2":
@@ -625,7 +632,8 @@ def train_lstm_temporal_from_preprocessed(
         "lstm_hidden_dim": lstm_hidden_dim,
         "lstm_layers": lstm_layers,
         "dropout": dropout,
-        "use_attention": use_attention,
+        "mask_target": mask_target,
+        "use_attention": False,
         "loss_type": loss_type,
         "learning_rate": learning_rate,
         "weight_decay": weight_decay,

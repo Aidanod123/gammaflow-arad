@@ -56,7 +56,7 @@ class TemporalModelConfig:
     lstm_hidden_dim: int
     lstm_layers: int
     dropout: float
-    use_attention: bool
+    mask_target: bool
 
 
 class TemporalLSTMAutoencoder(nn.Module):
@@ -79,7 +79,7 @@ class TemporalLSTMAutoencoder(nn.Module):
         lstm_hidden_dim: int = 128,
         lstm_layers: int = 1,
         dropout: float = 0.2,
-        use_attention: bool = False,
+        use_attention: Optional[bool] = None,
     ):
         super().__init__()
 
@@ -88,7 +88,13 @@ class TemporalLSTMAutoencoder(nn.Module):
         self.lstm_hidden_dim = int(lstm_hidden_dim)
         self.lstm_layers = int(lstm_layers)
         self.dropout = float(dropout)
-        self.use_attention = bool(use_attention)
+        if use_attention is not None:
+            warnings.warn(
+                "TemporalLSTMAutoencoder.use_attention is deprecated and ignored; "
+                "attention logic has been removed.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
 
         if self.n_bins % 32 != 0:
             raise ValueError(
@@ -185,32 +191,7 @@ class TemporalLSTMAutoencoder(nn.Module):
             encoded = encoded.masked_fill(mask.unsqueeze(-1), 0.0)
 
         temporal_out, _ = self.temporal_core(encoded)
-        if self.use_attention:
-            # NOTE: When use_attention=True, external trainer_fn should pass a mask
-            # with target timestep (-1) set True to prevent identity shortcut.
-            query = temporal_out[:, -1, :].unsqueeze(1)
-            scores = torch.sum(query * temporal_out, dim=-1)
-
-            if latent_timestep_mask is not None:
-                score_mask = mask
-                scores.masked_fill_(score_mask, float("-inf"))
-                fully_masked = score_mask.all(dim=1)
-                if torch.any(fully_masked):
-                    scores[fully_masked] = 0.0
-                    score_mask = score_mask.clone()
-                    score_mask[fully_masked, :] = False
-                    score_mask[fully_masked, -1] = True
-                    scores.masked_fill_(score_mask, float("-inf"))
-
-            attention_weights = torch.softmax(scores, dim=-1)
-            attention_weights = torch.nan_to_num(attention_weights, nan=0.0)
-            context_vector = torch.sum(
-                temporal_out * attention_weights.unsqueeze(-1),
-                dim=1,
-            )
-            final_embedding = context_vector
-        else:
-            final_embedding = temporal_out[:, -1, :]
+        final_embedding = temporal_out[:, -1, :]
 
         decoder_latent = self.temporal_to_latent(final_embedding)
         decoded_linear = self.decoder_linear(decoder_latent)
@@ -244,9 +225,8 @@ class LSTMTemporalDetector(BaseDetector):
         Number of stacked LSTM layers.
     dropout : float
         Dropout used in model blocks.
-    use_attention : bool
-        If True, reconstruct from attention-weighted temporal context instead
-        of directly using only the final LSTM timestep embedding.
+    mask_target : bool
+        If True, always mask the final timestep latent embedding.
     threshold : float or None
         Detection threshold. If None, set via ``set_threshold`` or FAR calibration.
     aggregation_gap : float
@@ -267,7 +247,8 @@ class LSTMTemporalDetector(BaseDetector):
         lstm_hidden_dim: int = 128,
         lstm_layers: int = 1,
         dropout: float = 0.2,
-        use_attention: bool = False,
+        mask_target: bool = True,
+        use_attention: Optional[bool] = None,
         threshold: Optional[float] = None,
         aggregation_gap: float = 2.0,
         loss_type: str = "jsd",
@@ -300,7 +281,18 @@ class LSTMTemporalDetector(BaseDetector):
         self.lstm_hidden_dim = int(lstm_hidden_dim)
         self.lstm_layers = int(lstm_layers)
         self.dropout = float(dropout)
-        self.use_attention = bool(use_attention)
+        if use_attention is not None:
+            warnings.warn(
+                "use_attention is deprecated and ignored; attention logic has been removed. "
+                "Use mask_target instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if bool(use_attention):
+                mask_target = True
+        self.mask_target = bool(mask_target)
+        # Backward compatibility for scripts that still reference this field.
+        self.use_attention = False
         self.loss_type = str(loss_type).lower()
         self.verbose = bool(verbose)
 
@@ -341,7 +333,6 @@ class LSTMTemporalDetector(BaseDetector):
             lstm_hidden_dim=self.lstm_hidden_dim,
             lstm_layers=self.lstm_layers,
             dropout=self.dropout,
-            use_attention=self.use_attention,
         ).to(self.device)
         self.model_.eval()
         return self
@@ -612,7 +603,7 @@ class LSTMTemporalDetector(BaseDetector):
                     masked_index_set=static_mask_set,
                     latent_mask_pct=latent_mask_pct,
                     rng=rng,
-                    mask_target_timestep=bool(self.use_attention),
+                    mask_target_timestep=bool(self.mask_target),
                 )
             )
 
@@ -620,6 +611,7 @@ class LSTMTemporalDetector(BaseDetector):
             return
 
         all_windows = np.stack(windows_list)              # (N, seq_len, n_bins)
+        del windows_list
         all_targets = counts[valid_indices]                # (N, n_bins)
         all_target_scales = None if target_count_rates is None else target_count_rates[valid_indices]
 
@@ -630,6 +622,7 @@ class LSTMTemporalDetector(BaseDetector):
             for j, m in enumerate(masks_list):
                 if m is not None:
                     all_masks[j] = m
+        del masks_list
 
         # --- Phase 2: batched forward passes ------------------------------
         self.model_.eval()
@@ -650,6 +643,7 @@ class LSTMTemporalDetector(BaseDetector):
                 recon = self.model_(win_t, latent_timestep_mask=mask_t)
                 scores = self._score_batch(tgt_t, recon, target_scales=scale_t)
                 scores_np = scores.cpu().numpy()
+                del win_t, tgt_t, scale_t, mask_t, recon, scores
 
                 for j, idx in enumerate(valid_indices[start:end]):
                     metrics[idx] = float(scores_np[j])
@@ -685,7 +679,7 @@ class LSTMTemporalDetector(BaseDetector):
                     masked_index_set=dynamic_masked_index_set,
                     latent_mask_pct=latent_mask_pct,
                     rng=rng,
-                    mask_target_timestep=bool(self.use_attention),
+                    mask_target_timestep=bool(self.mask_target),
                 )
 
                 window_tensor = torch.from_numpy(window).unsqueeze(0).to(self.device)
@@ -973,7 +967,7 @@ class LSTMTemporalDetector(BaseDetector):
             lstm_hidden_dim=self.lstm_hidden_dim,
             lstm_layers=self.lstm_layers,
             dropout=self.dropout,
-            use_attention=self.use_attention,
+            mask_target=self.mask_target,
         )
 
         payload = {
@@ -984,7 +978,8 @@ class LSTMTemporalDetector(BaseDetector):
             "loss_type": self.loss_type,
             "threshold": self.threshold,
             "aggregation_gap": self.aggregation_gap,
-            "use_attention": self.use_attention,
+            "mask_target": self.mask_target,
+            "use_attention": False,
         }
 
         torch.save(payload, path)
@@ -1002,7 +997,13 @@ class LSTMTemporalDetector(BaseDetector):
         self.loss_type = str(payload.get("loss_type", self.loss_type)).lower()
         self.threshold = payload.get("threshold", self.threshold)
         self.aggregation_gap = float(payload.get("aggregation_gap", self.aggregation_gap))
-        self.use_attention = bool(payload.get("use_attention", cfg.get("use_attention", self.use_attention)))
+        # Backward compatibility: legacy checkpoints may only have use_attention.
+        if "mask_target" in payload:
+            self.mask_target = bool(payload["mask_target"])
+        elif "mask_target" in cfg:
+            self.mask_target = bool(cfg["mask_target"])
+        else:
+            self.mask_target = bool(payload.get("use_attention", cfg.get("use_attention", True)))
 
         self.n_bins_ = int(cfg["n_bins"])
         self.latent_dim = int(cfg["latent_dim"])
@@ -1016,7 +1017,6 @@ class LSTMTemporalDetector(BaseDetector):
             lstm_hidden_dim=self.lstm_hidden_dim,
             lstm_layers=self.lstm_layers,
             dropout=self.dropout,
-            use_attention=self.use_attention,
         ).to(self.device)
         self.model_.load_state_dict(payload["model_state"])
         self.model_.eval()
@@ -1028,7 +1028,7 @@ class LSTMTemporalDetector(BaseDetector):
         return (
             f"LSTMTemporalDetector(seq_len={self.seq_len}, "
             f"seq_stride={self.seq_stride}, "
-            f"use_attention={self.use_attention}, "
+            f"mask_target={self.mask_target}, "
             f"loss_type='{self.loss_type}', "
             f"trained={self.is_trained}, alarms={len(self.alarms)})"
         )

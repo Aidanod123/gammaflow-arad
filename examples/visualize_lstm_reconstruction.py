@@ -167,7 +167,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--indices", nargs="*", type=int, default=None)
-    parser.add_argument("--top-k", type=int, default=6)
+    parser.add_argument("--top-k", type=int, default=None)
+    parser.add_argument("--num-random", type=int, default=8)
+    parser.add_argument("--random-seed", type=int, default=42)
     parser.add_argument("--log-y", action="store_true")
     parser.add_argument("--latent-mask-pct", type=float, default=0.0)
     parser.add_argument("--latent-mask-seed", type=int, default=None)
@@ -216,22 +218,28 @@ def main() -> None:
 
     detector.load(str(args.model_path))
 
+    # Valid indices are those with enough causal history (past warmup).
+    warmup = detector.warmup_samples
+    valid_idx = np.arange(warmup, ts.n_spectra)
+
     if args.indices:
-        selected = [int(i) for i in args.indices if 0 <= int(i) < ts.n_spectra]
-    else:
+        selected = [int(i) for i in args.indices if warmup <= int(i) < ts.n_spectra]
+    elif args.top_k is not None:
         scores = detector.score_time_series(
             ts,
             target_count_rates=target_count_rates,
             latent_mask_pct=float(args.latent_mask_pct),
             mask_seed=args.latent_mask_seed,
         )
-        valid_idx = np.where(np.isfinite(scores))[0]
-        if valid_idx.size == 0:
+        finite_idx = np.where(np.isfinite(scores))[0]
+        if finite_idx.size == 0:
             raise RuntimeError("No finite scores available for this run/model")
-        valid_scores = scores[valid_idx]
-        order = np.argsort(valid_scores)[::-1]
-        k = max(1, int(args.top_k))
-        selected = [int(valid_idx[j]) for j in order[:k]]
+        order = np.argsort(scores[finite_idx])[::-1]
+        selected = [int(finite_idx[j]) for j in order[: max(1, int(args.top_k))]]
+    else:
+        rng = np.random.default_rng(int(args.random_seed))
+        k = min(max(1, int(args.num_random)), valid_idx.size)
+        selected = sorted(rng.choice(valid_idx, size=k, replace=False).tolist())
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -261,8 +269,14 @@ def main() -> None:
         score, target_arr, recon_arr = out
 
         spec = ts[int(idx)]
+
+        # Scale target from L1-normalized (sum=1) to count units so both
+        # target and recon reflect what chi2 actually operates on.
+        scale = float(target_count_rates[idx]) if target_count_rates is not None else 1.0
+        target_counts = np.asarray(target_arr, dtype=np.float64) * scale
+
         target_spec = Spectrum(
-            counts=target_arr,
+            counts=target_counts,
             energy_edges=spec.energy_edges,
             timestamp=spec.timestamp,
             real_time=spec.real_time,
@@ -279,7 +293,7 @@ def main() -> None:
         fig, ax = plot_spectrum_comparison(
             [target_spec, recon_spec],
             labels=["Input (target)", "Reconstruction"],
-            mode="count_rate",
+            mode="counts",
             log_y=bool(args.log_y),
         )
         ax.set_title(f"Index {idx} | Score={score:.6f}")

@@ -46,7 +46,7 @@ def _build_wandb_config(args: argparse.Namespace) -> Dict[str, Any]:
         "lstm_hidden_dim": args.lstm_hidden_dim,
         "lstm_layers": args.lstm_layers,
         "dropout": args.dropout,
-        "use_attention": args.use_attention,
+        "mask_target": args.mask_target,
         "loss_type": args.loss_type,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
@@ -95,9 +95,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lstm-layers", type=int, default=1)
     parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument(
-        "--use-attention",
-        action="store_true",
-        help="Enable temporal attention context over LSTM outputs",
+        "--mask-target",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Always mask the target timestep latent embedding (default: true)",
     )
     parser.add_argument("--loss-type", type=str, default="jsd", choices=["mse", "jsd", "chi2"])
     parser.add_argument("--learning-rate", type=float, default=1e-3)
@@ -244,7 +245,7 @@ def main() -> None:
         lstm_hidden_dim=args.lstm_hidden_dim,
         lstm_layers=args.lstm_layers,
         dropout=args.dropout,
-        use_attention=args.use_attention,
+        mask_target=args.mask_target,
         loss_type=args.loss_type,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
@@ -288,7 +289,7 @@ def main() -> None:
                 "loss_type": args.loss_type,
                 "seq_len": args.seq_len,
                 "seq_stride": args.seq_stride,
-                "use_attention": args.use_attention,
+                "mask_target": args.mask_target,
                 "latent_mask_pct": args.latent_mask_pct,
                 "best_epoch": int(result.get("best_epoch", 0)),
                 "epochs_completed": int(result.get("epochs_completed", 0)),

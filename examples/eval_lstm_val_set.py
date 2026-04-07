@@ -34,6 +34,7 @@ python examples/eval_lstm_val_set.py \\
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import sys
 from pathlib import Path
@@ -251,9 +252,9 @@ def _calibrate_threshold(
 ) -> float:
     """Calibrate threshold to target FAR using clean background runs.
 
-    Concatenates all runs into one SpectralTimeSeries and delegates to
-    detector.set_threshold_by_far(), which does a proper binary search on
-    actual alarm aggregation counts — not a raw percentile approximation.
+    Scores each run independently (avoiding one giant window array in memory),
+    concatenates only the resulting scores and timestamps, then does a binary
+    search on actual alarm-aggregation counts.
     """
     run_files = sorted(
         calibration_dir.glob("run*.pt"),
@@ -262,60 +263,100 @@ def _calibrate_threshold(
     if not run_files:
         raise FileNotFoundError(f"No run*.pt files found in {calibration_dir}")
 
-    all_counts: List[np.ndarray] = []
+    all_scores: List[np.ndarray] = []
     all_timestamps: List[np.ndarray] = []
-    all_real_times: List[np.ndarray] = []
-    all_live_times: List[np.ndarray] = []
-    all_target_scales: List[np.ndarray] = []
-    energy_edges = None
     t_offset = 0.0
 
+    print(f"Scoring {len(run_files)} calibration runs ...")
     for run_path in run_files:
         payload, ts = _load_run(run_path)
-        counts = np.asarray(ts.counts, dtype=np.float64)
-        real_times = np.asarray(ts.real_times, dtype=np.float64)
-        live_times_arr = (
-            np.asarray(ts.live_times, dtype=np.float64)
-            if ts.live_times is not None
-            else real_times.copy()
+        target_count_rates = _target_count_rates_from_payload(payload, ts.n_spectra)
+
+        scores = detector.score_time_series(
+            ts,
+            target_count_rates=target_count_rates,
+            latent_mask_pct=float(latent_mask_pct),
+            mask_seed=mask_seed,
         )
+
         timestamps = np.asarray(ts.timestamps, dtype=np.float64)
-        # Shift timestamps so runs are sequential, not overlapping.
+        real_times = np.asarray(ts.real_times, dtype=np.float64)
         timestamps = timestamps - timestamps[0] + t_offset
         t_offset = float(timestamps[-1]) + float(np.median(real_times))
 
-        all_counts.append(counts)
+        all_scores.append(np.asarray(scores, dtype=np.float64))
         all_timestamps.append(timestamps)
-        all_real_times.append(real_times)
-        all_live_times.append(live_times_arr)
 
-        scales = _target_count_rates_from_payload(payload, ts.n_spectra)
-        if scales is None:
-            scales = counts.sum(axis=1).astype(np.float32)
-        all_target_scales.append(scales.astype(np.float64))
+        del payload, ts, target_count_rates, scores, timestamps, real_times
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-        if energy_edges is None and ts.energy_edges is not None:
-            energy_edges = np.asarray(ts.energy_edges, dtype=np.float64)
+    scores_cat = np.concatenate(all_scores)
+    times_cat = np.concatenate(all_timestamps)
+    finite_scores = scores_cat[np.isfinite(scores_cat)]
 
-    counts_cat = np.concatenate(all_counts, axis=0)
-    ts_cat = SpectralTimeSeries.from_array(
-        counts_cat,
-        energy_edges=energy_edges,
-        timestamps=np.concatenate(all_timestamps),
-        live_times=np.concatenate(all_live_times),
-        real_times=np.concatenate(all_real_times),
+    if finite_scores.size == 0:
+        raise ValueError("No finite scores from calibration runs.")
+
+    total_time_seconds = float(times_cat[-1] - times_cat[0])
+    if total_time_seconds <= 0:
+        raise ValueError(f"Invalid calibration time span: {total_time_seconds}s")
+    total_time_hours = total_time_seconds / 3600.0
+
+    print(
+        f"  {finite_scores.size} finite scores over {total_time_hours:.2f} hours\n"
+        f"  Score range: [{finite_scores.min():.4f}, {finite_scores.max():.4f}]\n"
+        f"  Score mean +/- std: {finite_scores.mean():.4f} +/- {finite_scores.std():.4f}"
     )
-    target_count_rates_cat = np.concatenate(all_target_scales).astype(np.float32)
 
-    threshold = detector.set_threshold_by_far(
-        background_data=ts_cat,
-        alarms_per_hour=float(alarms_per_hour),
-        target_count_rates=target_count_rates_cat,
-        latent_mask_pct=float(latent_mask_pct),
-        mask_seed=mask_seed,
-        verbose=True,
+    # Binary search on actual alarm aggregation counts.
+    low = float(finite_scores.min())
+    high = float(finite_scores.max()) * 1.5
+    best_threshold = float(np.percentile(finite_scores, 99.0))
+    best_far_diff = float("inf")
+
+    for iteration in range(20):
+        test_threshold = (low + high) / 2.0
+        detector.threshold = test_threshold
+        detector._aggregate_alarms_from_scores(
+            scores=scores_cat,
+            times=times_cat,
+            threshold=test_threshold,
+        )
+        n_alarms = len(detector.alarms)
+        observed_far = n_alarms / total_time_hours
+        far_diff = abs(observed_far - alarms_per_hour)
+
+        print(
+            f"  Iter {iteration + 1}: threshold={test_threshold:.6f} "
+            f"-> {n_alarms} alarms ({observed_far:.2f}/hr)"
+        )
+
+        if far_diff < best_far_diff:
+            best_far_diff = far_diff
+            best_threshold = test_threshold
+
+        if observed_far > alarms_per_hour:
+            low = test_threshold
+        else:
+            high = test_threshold
+
+        if far_diff < 0.1 * alarms_per_hour or (high - low) < 1e-8:
+            print(f"  Converged after {iteration + 1} iterations")
+            break
+
+    detector.threshold = best_threshold
+    detector._aggregate_alarms_from_scores(
+        scores=scores_cat, times=times_cat, threshold=best_threshold
     )
-    return float(threshold)
+    final_far = len(detector.alarms) / total_time_hours
+    print(
+        f"\n  Threshold set: {best_threshold:.6f}\n"
+        f"  Achieved FAR: {final_far:.2f} alarms/hour ({len(detector.alarms)} alarms)\n"
+        f"  Target FAR: {alarms_per_hour:.2f} alarms/hour"
+    )
+    return best_threshold
 
 
 # ---------------------------------------------------------------------------
@@ -524,9 +565,16 @@ def main() -> None:
                 )
                 n_source_windows = int(np.sum(labels))
 
-        n_alarms = 0
+        alarm_events: List[Tuple[float, float]] = []
         if detector.threshold is not None:
-            n_alarms = int(np.sum(finite_scores > detector.threshold))
+            timestamps_np = np.asarray(ts.timestamps, dtype=np.float64)
+            detector._aggregate_alarms_from_scores(
+                scores=np.asarray(scores, dtype=np.float64),
+                times=timestamps_np,
+                threshold=float(detector.threshold),
+            )
+            alarm_events = [(float(a.start_time), float(a.end_time)) for a in detector.alarms]
+        n_alarm_events = len(alarm_events)
 
         title_extra = ""
         if n_source_windows > 0:
@@ -545,7 +593,7 @@ def main() -> None:
         )
 
         print(f"max={score_max:.4g}  mean={score_mean:.4g}  "
-              f"alarms={n_alarms}  source_windows={n_source_windows}  -> {out_png.name}")
+              f"alarm_events={n_alarm_events}  source_windows={n_source_windows}  -> {out_png.name}")
 
         results.append({
             "run_name": run_path.name,
@@ -554,11 +602,16 @@ def main() -> None:
             "n_finite_scores": n_finite,
             "score_max": score_max,
             "score_mean": score_mean,
-            "n_alarms": n_alarms,
+            "n_alarm_events": n_alarm_events,
             "n_source_windows": n_source_windows,
             "n_source_intervals": 0 if source_intervals is None else len(source_intervals),
             "plot_path": str(out_png.resolve()),
         })
+
+        del payload, ts, scores, finite_scores, alarm_events
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     summary: Dict[str, Any] = {
         "model_path": str(model_path),
