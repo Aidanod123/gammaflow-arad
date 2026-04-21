@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import List, Optional, Sequence, Set
 import warnings
 
 import numpy as np
@@ -41,10 +41,14 @@ def _score_batch_fn(
     recon: "torch.Tensor",
     loss_type: str,
     target_scales: Optional["torch.Tensor"] = None,
+    score_type: Optional[str] = None,
 ) -> "torch.Tensor":
     """Lazy wrapper that imports from training.losses on first call."""
     from gammaflow.training.losses import score_batch  # noqa: deferred to avoid circular import
-    return score_batch(targets, recon, loss_type, target_scales=target_scales)
+    return score_batch(targets, recon, loss_type, target_scales=target_scales, score_type=score_type)
+
+
+_VALID_OUTPUT_ACTIVATIONS = ("sigmoid", "softmax")
 
 
 @dataclass
@@ -57,6 +61,8 @@ class TemporalModelConfig:
     lstm_layers: int
     dropout: float
     mask_target: bool
+    output_activation: str = "sigmoid"
+    count_rate_conditioning: bool = False
 
 
 class TemporalLSTMAutoencoder(nn.Module):
@@ -80,6 +86,9 @@ class TemporalLSTMAutoencoder(nn.Module):
         lstm_layers: int = 1,
         dropout: float = 0.2,
         use_attention: Optional[bool] = None,
+        output_activation: str = "sigmoid",
+        count_rate_conditioning: bool = False,
+        crc_version: int = 2,
     ):
         super().__init__()
 
@@ -95,6 +104,16 @@ class TemporalLSTMAutoencoder(nn.Module):
                 DeprecationWarning,
                 stacklevel=2,
             )
+
+        output_activation = str(output_activation).lower()
+        if output_activation not in _VALID_OUTPUT_ACTIVATIONS:
+            raise ValueError(
+                f"output_activation must be one of {_VALID_OUTPUT_ACTIVATIONS}, "
+                f"got '{output_activation}'"
+            )
+        self.output_activation = output_activation
+        self.count_rate_conditioning = bool(count_rate_conditioning)
+        self.crc_version = int(crc_version) if self.count_rate_conditioning else None
 
         if self.n_bins % 32 != 0:
             raise ValueError(
@@ -130,19 +149,45 @@ class TemporalLSTMAutoencoder(nn.Module):
             nn.BatchNorm1d(self.latent_dim),
         )
 
+        # When count_rate_conditioning is enabled, log1p(total_counts) is used
+        # to condition the decoder.  Two versions:
+        #   v1 (legacy): raw scalar concatenated directly → decoder_in = latent_dim + 1
+        #   v2 (current): projected through nn.Linear(1,4) → decoder_in = latent_dim + 4
+        if self.count_rate_conditioning:
+            if self.crc_version == 1:
+                _cr_extra_dim = 1
+            else:
+                _cr_extra_dim = 4
+                self.cr_embed = nn.Linear(1, _cr_extra_dim)
+        else:
+            _cr_extra_dim = 0
+        _decoder_in_dim = self.latent_dim + _cr_extra_dim
         self.decoder_linear = nn.Sequential(
-            nn.Linear(self.latent_dim, 8 * self._downsampled_bins),
+            nn.Linear(_decoder_in_dim, 8 * self._downsampled_bins),
             nn.Mish(),
             nn.BatchNorm1d(8 * self._downsampled_bins),
         )
 
-        self.decoder = nn.Sequential(
-            ARADDecoderBlock(8, 8, 3, self.dropout),
-            ARADDecoderBlock(8, 8, 3, self.dropout),
-            ARADDecoderBlock(8, 8, 3, self.dropout),
-            ARADDecoderBlock(8, 8, 5, self.dropout),
-            ARADDecoderBlock(8, 1, 7, self.dropout, is_output=True),
-        )
+        if self.output_activation == "softmax":
+            # Shared hidden decoder blocks (no output activation).
+            self.decoder = nn.Sequential(
+                ARADDecoderBlock(8, 8, 3, self.dropout),
+                ARADDecoderBlock(8, 8, 3, self.dropout),
+                ARADDecoderBlock(8, 8, 3, self.dropout),
+                ARADDecoderBlock(8, 8, 5, self.dropout),
+            )
+            # Separate final layer — softmax is applied over bins in forward().
+            self.output_upsample = nn.Upsample(scale_factor=2, mode="nearest")
+            self.output_deconv = nn.ConvTranspose1d(8, 1, 7, padding=3)
+        else:
+            # Default sigmoid path — identical to original ARAD decoder.
+            self.decoder = nn.Sequential(
+                ARADDecoderBlock(8, 8, 3, self.dropout),
+                ARADDecoderBlock(8, 8, 3, self.dropout),
+                ARADDecoderBlock(8, 8, 3, self.dropout),
+                ARADDecoderBlock(8, 8, 5, self.dropout),
+                ARADDecoderBlock(8, 1, 7, self.dropout, is_output=True),
+            )
 
         self.apply(self._init_weights)
 
@@ -161,6 +206,7 @@ class TemporalLSTMAutoencoder(nn.Module):
         self,
         windows: torch.Tensor,
         latent_timestep_mask: Optional[torch.Tensor] = None,
+        count_rate: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass from sequence window to final-step reconstruction.
 
@@ -172,6 +218,10 @@ class TemporalLSTMAutoencoder(nn.Module):
             Boolean mask of shape ``(batch, seq_len)`` (or ``(seq_len,)``).
             True entries zero-out the corresponding latent timestep after the
             encoder and before the temporal LSTM.
+        count_rate : torch.Tensor, optional
+            Total counts per target spectrum, shape ``(batch,)``.  Only used
+            when ``count_rate_conditioning=True``.  ``log1p`` is applied
+            internally before concatenating to the latent vector.
         """
         batch_size, seq_len, _ = windows.shape
         flat_windows = windows.reshape(batch_size * seq_len, self.n_bins)
@@ -194,10 +244,36 @@ class TemporalLSTMAutoencoder(nn.Module):
         final_embedding = temporal_out[:, -1, :]
 
         decoder_latent = self.temporal_to_latent(final_embedding)
+
+        if self.count_rate_conditioning:
+            if count_rate is not None:
+                cr_raw = torch.log1p(
+                    count_rate.float().to(decoder_latent.device)
+                ).unsqueeze(-1)  # (batch, 1)
+            else:
+                # No count rate available — fill with zero (log1p(0) = 0).
+                cr_raw = torch.zeros(
+                    decoder_latent.shape[0], 1,
+                    device=decoder_latent.device,
+                    dtype=decoder_latent.dtype,
+                )
+            if self.crc_version == 1:
+                # Legacy: concatenate scalar directly.
+                decoder_latent = torch.cat([decoder_latent, cr_raw], dim=-1)
+            else:
+                # v2: project through learned embedding before concatenating.
+                cr_emb = self.cr_embed(cr_raw)  # (batch, 4)
+                decoder_latent = torch.cat([decoder_latent, cr_emb], dim=-1)
+
         decoded_linear = self.decoder_linear(decoder_latent)
         decoded_linear = decoded_linear.view(batch_size, 8, self._downsampled_bins)
-        reconstructed_last = self.decoder(decoded_linear).view(batch_size, self.n_bins)
-        return reconstructed_last
+
+        if self.output_activation == "softmax":
+            x = self.decoder(decoded_linear)
+            x = self.output_deconv(self.output_upsample(x))
+            return torch.softmax(x.view(batch_size, self.n_bins), dim=-1)
+
+        return self.decoder(decoded_linear).view(batch_size, self.n_bins)
 
 
 class LSTMTemporalDetector(BaseDetector):
@@ -252,6 +328,8 @@ class LSTMTemporalDetector(BaseDetector):
         threshold: Optional[float] = None,
         aggregation_gap: float = 2.0,
         loss_type: str = "jsd",
+        output_activation: str = "sigmoid",
+        count_rate_conditioning: bool = False,
         device: Optional[str] = None,
         verbose: bool = True,
     ):
@@ -296,8 +374,18 @@ class LSTMTemporalDetector(BaseDetector):
         self.loss_type = str(loss_type).lower()
         self.verbose = bool(verbose)
 
-        if self.loss_type not in ("jsd", "chi2"):
-            raise ValueError(f"loss_type must be 'jsd' or 'chi2', got '{loss_type}'")
+        output_activation = str(output_activation).lower()
+        if output_activation not in _VALID_OUTPUT_ACTIVATIONS:
+            raise ValueError(
+                f"output_activation must be one of {_VALID_OUTPUT_ACTIVATIONS}, "
+                f"got '{output_activation}'"
+            )
+        self.output_activation = output_activation
+
+        self.count_rate_conditioning = bool(count_rate_conditioning)
+
+        if self.loss_type not in ("jsd", "chi2", "poisson"):
+            raise ValueError(f"loss_type must be 'jsd', 'chi2', or 'poisson', got '{loss_type}'")
 
         if device is None:
             if torch.cuda.is_available():
@@ -333,6 +421,9 @@ class LSTMTemporalDetector(BaseDetector):
             lstm_hidden_dim=self.lstm_hidden_dim,
             lstm_layers=self.lstm_layers,
             dropout=self.dropout,
+            output_activation=self.output_activation,
+            count_rate_conditioning=self.count_rate_conditioning,
+            crc_version=2,
         ).to(self.device)
         self.model_.eval()
         return self
@@ -390,6 +481,7 @@ class LSTMTemporalDetector(BaseDetector):
         targets: torch.Tensor,
         recon: torch.Tensor,
         target_scales: Optional[torch.Tensor] = None,
+        score_type: Optional[str] = None,
     ) -> torch.Tensor:
         """Per-sample anomaly scores.  Delegates to ``gammaflow.training.losses``."""
         return _score_batch_fn(
@@ -397,6 +489,7 @@ class LSTMTemporalDetector(BaseDetector):
             recon,
             self.loss_type,
             target_scales=target_scales,
+            score_type=score_type,
         )
 
     def _window_indices_for_end(self, end_idx: int) -> Optional[np.ndarray]:
@@ -456,6 +549,7 @@ class LSTMTemporalDetector(BaseDetector):
         mask_alarm_feedback: bool = False,
         feedback_threshold: Optional[float] = None,
         inference_batch_size: int = 256,
+        score_type: Optional[str] = None,
     ) -> np.ndarray:
         """
         Score time series with causal rolling windows.
@@ -491,6 +585,11 @@ class LSTMTemporalDetector(BaseDetector):
         normalize_inputs_l1 : bool
             If True, L1-normalize each input spectrum before building windows.
             Keep False when the preprocessed inputs are already L1-normalized.
+        score_type : str or None
+            Override the scoring metric independently of the training loss.
+            When ``None`` (default), uses the model's ``loss_type``.
+            Supported: ``"jsd"``, ``"corrected_jsd"``, ``"chi2"``,
+            ``"normalized_chi2"``, ``"reduced_chi2"``.
         """
         if not self.is_trained:
             raise RuntimeError(
@@ -524,9 +623,11 @@ class LSTMTemporalDetector(BaseDetector):
             counts_row_sums = np.maximum(counts_row_sums, 1e-10)
             counts = counts / counts_row_sums
 
-        if self.loss_type == "chi2" and target_count_rates is None:
+        effective_score_type = score_type if score_type is not None else self.loss_type
+        _needs_scales = ("chi2", "normalized_chi2", "corrected_jsd", "reduced_chi2", "combined")
+        if effective_score_type in _needs_scales and target_count_rates is None:
             raise ValueError(
-                "target_count_rates are required for chi2 scoring. "
+                f"target_count_rates are required for {effective_score_type} scoring. "
                 "Pass one scalar per spectrum aligned with the input time series."
             )
 
@@ -554,6 +655,7 @@ class LSTMTemporalDetector(BaseDetector):
                 latent_mask_pct=float(latent_mask_pct),
                 mask_seed=mask_seed,
                 threshold_for_feedback=threshold_for_feedback,
+                score_type=score_type,
             )
         else:
             self._score_batched(
@@ -564,6 +666,7 @@ class LSTMTemporalDetector(BaseDetector):
                 latent_mask_pct=float(latent_mask_pct),
                 mask_seed=mask_seed,
                 batch_size=max(1, int(inference_batch_size)),
+                score_type=score_type,
             )
 
         return metrics
@@ -581,6 +684,7 @@ class LSTMTemporalDetector(BaseDetector):
         latent_mask_pct: float,
         mask_seed: Optional[int],
         batch_size: int,
+        score_type: Optional[str] = None,
     ) -> None:
         """Pre-build all windows then score in GPU-friendly batches."""
         rng = np.random.default_rng(mask_seed) if latent_mask_pct > 0.0 else None
@@ -640,8 +744,9 @@ class LSTMTemporalDetector(BaseDetector):
                 if all_masks is not None:
                     mask_t = torch.from_numpy(all_masks[start:end]).to(self.device)
 
-                recon = self.model_(win_t, latent_timestep_mask=mask_t)
-                scores = self._score_batch(tgt_t, recon, target_scales=scale_t)
+                cr_t = scale_t if self.count_rate_conditioning else None
+                recon = self.model_(win_t, latent_timestep_mask=mask_t, count_rate=cr_t)
+                scores = self._score_batch(tgt_t, recon, target_scales=scale_t, score_type=score_type)
                 scores_np = scores.cpu().numpy()
                 del win_t, tgt_t, scale_t, mask_t, recon, scores
 
@@ -661,6 +766,7 @@ class LSTMTemporalDetector(BaseDetector):
         latent_mask_pct: float,
         mask_seed: Optional[int],
         threshold_for_feedback: Optional[float],
+        score_type: Optional[str] = None,
     ) -> None:
         """One-at-a-time scoring with alarm-feedback masking."""
         rng = np.random.default_rng(mask_seed) if latent_mask_pct > 0.0 else None
@@ -702,11 +808,13 @@ class LSTMTemporalDetector(BaseDetector):
                 reconstruction = self.model_(
                     window_tensor,
                     latent_timestep_mask=latent_mask_tensor,
+                    count_rate=scale_tensor if self.count_rate_conditioning else None,
                 )
                 score = self._score_batch(
                     target_tensor,
                     reconstruction,
                     target_scales=scale_tensor,
+                    score_type=score_type,
                 )
                 metrics[i] = float(score.item())
 
@@ -726,6 +834,7 @@ class LSTMTemporalDetector(BaseDetector):
         latent_mask_pct: float = 0.0,
         mask_seed: Optional[int] = None,
         mask_alarm_feedback: bool = False,
+        score_type: Optional[str] = None,
     ) -> np.ndarray:
         """
         Process a time series and aggregate alarms from temporal scores.
@@ -752,6 +861,7 @@ class LSTMTemporalDetector(BaseDetector):
             mask_seed=mask_seed,
             mask_alarm_feedback=mask_alarm_feedback,
             feedback_threshold=self.threshold,
+            score_type=score_type,
         )
         times = self._extract_timestamps(time_series)
 
@@ -968,6 +1078,8 @@ class LSTMTemporalDetector(BaseDetector):
             lstm_layers=self.lstm_layers,
             dropout=self.dropout,
             mask_target=self.mask_target,
+            output_activation=self.output_activation,
+            count_rate_conditioning=self.count_rate_conditioning,
         )
 
         payload = {
@@ -980,6 +1092,10 @@ class LSTMTemporalDetector(BaseDetector):
             "aggregation_gap": self.aggregation_gap,
             "mask_target": self.mask_target,
             "use_attention": False,
+            # v2: count_rate_conditioning uses nn.Linear(1,4) embedding instead
+            # of raw scalar concatenation. Older checkpoints (no key or "v1")
+            # used scalar injection and cannot be loaded with this code.
+            "crc_version": 2 if self.count_rate_conditioning else None,
         }
 
         torch.save(payload, path)
@@ -1010,6 +1126,28 @@ class LSTMTemporalDetector(BaseDetector):
         self.lstm_hidden_dim = int(cfg["lstm_hidden_dim"])
         self.lstm_layers = int(cfg["lstm_layers"])
         self.dropout = float(cfg["dropout"])
+        self.output_activation = str(
+            cfg.get("output_activation", "sigmoid")
+        ).lower()
+        self.count_rate_conditioning = bool(
+            cfg.get("count_rate_conditioning", False)
+        )
+
+        # Determine CRC architecture version from checkpoint metadata.
+        # v1: legacy scalar concatenation (latent_dim + 1, no cr_embed layer)
+        # v2: nn.Linear(1,4) embedding (latent_dim + 4, has cr_embed layer)
+        # When crc_version is missing from the payload (model trained before
+        # the key was added), infer from the state dict keys.
+        if self.count_rate_conditioning:
+            saved_version = payload.get("crc_version")
+            if saved_version is not None:
+                crc_version = int(saved_version)
+            elif "cr_embed.weight" in payload["model_state"]:
+                crc_version = 2
+            else:
+                crc_version = 1
+        else:
+            crc_version = 2  # irrelevant when CRC is off
 
         self.model_ = TemporalLSTMAutoencoder(
             n_bins=self.n_bins_,
@@ -1017,6 +1155,9 @@ class LSTMTemporalDetector(BaseDetector):
             lstm_hidden_dim=self.lstm_hidden_dim,
             lstm_layers=self.lstm_layers,
             dropout=self.dropout,
+            output_activation=self.output_activation,
+            count_rate_conditioning=self.count_rate_conditioning,
+            crc_version=crc_version,
         ).to(self.device)
         self.model_.load_state_dict(payload["model_state"])
         self.model_.eval()
@@ -1030,5 +1171,7 @@ class LSTMTemporalDetector(BaseDetector):
             f"seq_stride={self.seq_stride}, "
             f"mask_target={self.mask_target}, "
             f"loss_type='{self.loss_type}', "
+            f"output_activation='{self.output_activation}', "
+            f"count_rate_conditioning={self.count_rate_conditioning}, "
             f"trained={self.is_trained}, alarms={len(self.alarms)})"
         )

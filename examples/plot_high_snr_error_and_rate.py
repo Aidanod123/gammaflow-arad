@@ -272,74 +272,23 @@ def _gross_count_rate_from_h5(
     return rates
 
 
-def _source_window_labels_from_h5(
-    h5_path: Path,
-    run_id: int,
-    timestamps: np.ndarray,
-    integration_time: float,
-    time_units: str,
-) -> np.ndarray:
+def _source_times_from_h5(h5_path: Path, run_id: int) -> np.ndarray:
+    """Return source injection times in seconds.
+
+    ``sources/time`` is stored in milliseconds in the H5 file.  Each entry
+    is the absolute time (within the run) at which a source injection began.
+    """
     run_key = f"run{run_id}"
     with h5py.File(h5_path, "r") as f:
         runs = f["runs"]
         if run_key not in runs:
-            return np.zeros_like(timestamps, dtype=bool)
-
+            return np.array([], dtype=np.float64)
         run_group = runs[run_key]
-        listmode = run_group["listmode"]
-        if "id" not in listmode:
-            return np.zeros_like(timestamps, dtype=bool)
-
-        event_ids = np.asarray(listmode["id"])
-        dt = np.asarray(listmode["dt"], dtype=np.float64)
-
-        source_group = None
-        if "source" in run_group:
-            source_group = run_group["source"]
-        elif "sources" in run_group:
-            source_group = run_group["sources"]
-        if source_group is None or "id" not in source_group:
-            return np.zeros_like(timestamps, dtype=bool)
-
-        source_ids = np.asarray(source_group["id"])
-        if source_ids.size == 0:
-            return np.zeros_like(timestamps, dtype=bool)
-
-        source_event_mask = np.isin(event_ids, source_ids)
-        if not np.any(source_event_mask):
-            return np.zeros_like(timestamps, dtype=bool)
-
-        abs_times = np.cumsum(dt * _time_unit_scale(time_units))
-        src_event_times = abs_times[source_event_mask]
-
-    labels = np.zeros_like(timestamps, dtype=bool)
-    half = float(integration_time) / 2.0
-    for i, center in enumerate(timestamps):
-        t0 = center - half
-        t1 = center + half
-        left = np.searchsorted(src_event_times, t0, side="left")
-        right = np.searchsorted(src_event_times, t1, side="left")
-        labels[i] = right > left
-    return labels
-
-
-def _label_intervals(timestamps: np.ndarray, labels: np.ndarray) -> List[Tuple[float, float]]:
-    intervals: List[Tuple[float, float]] = []
-    if labels.size == 0:
-        return intervals
-
-    in_seg = False
-    start_t = 0.0
-    for t, v in zip(timestamps, labels):
-        if bool(v) and not in_seg:
-            in_seg = True
-            start_t = float(t)
-        elif (not bool(v)) and in_seg:
-            in_seg = False
-            intervals.append((start_t, float(t)))
-    if in_seg:
-        intervals.append((start_t, float(timestamps[-1])))
-    return intervals
+        source_group = run_group.get("sources") or run_group.get("source")
+        if source_group is None or "time" not in source_group:
+            return np.array([], dtype=np.float64)
+        times_ms = np.asarray(source_group["time"], dtype=np.float64)
+    return times_ms / 1000.0  # ms → s
 
 
 def _score_run_lstm(
@@ -350,15 +299,23 @@ def _score_run_lstm(
     mask_seed: Optional[int],
     target_count_rates: Optional[np.ndarray],
     normalize_inputs_l1: bool,
+    score_type: Optional[str] = None,
 ) -> np.ndarray:
     detector = LSTMTemporalDetector(device=device, verbose=False)
     detector.load(str(model_path))
+    if detector.count_rate_conditioning and target_count_rates is None:
+        print(
+            "WARNING: model uses count-rate conditioning (CRC) but no "
+            "target_count_rates found in run payload — decoder will receive "
+            "zero conditioning, scores will be unreliable."
+        )
     return detector.score_time_series(
         ts,
         target_count_rates=target_count_rates,
         normalize_inputs_l1=bool(normalize_inputs_l1),
         latent_mask_pct=float(latent_mask_pct),
         mask_seed=mask_seed,
+        score_type=score_type,
     )
 
 
@@ -368,6 +325,47 @@ def _score_run_arad(model_path: Path, ts: SpectralTimeSeries, device: str) -> np
     return detector.score_time_series(ts)
 
 
+def _suppress_low_count_tail_artifact(
+    scores: np.ndarray,
+    target_scales: Optional[np.ndarray],
+    min_fraction_of_median: float = 0.05,
+    min_scale_floor: float = 50.0,
+) -> np.ndarray:
+    """Mask trailing low-count windows that create non-physical tail spikes.
+
+    Some runs end with a partial low-count window whose target scale is orders
+    of magnitude smaller than the run median. That final point can dominate the
+    error plot while not being representative of detector behavior.
+    """
+    if target_scales is None:
+        return scores
+
+    out = np.asarray(scores, dtype=np.float64).copy()
+    scales = np.asarray(target_scales, dtype=np.float64)
+    if out.shape != scales.shape:
+        return out
+
+    finite_positive = scales[np.isfinite(scales) & (scales > 0.0)]
+    if finite_positive.size == 0:
+        return out
+
+    median_scale = float(np.median(finite_positive))
+    cutoff = max(float(min_scale_floor), float(min_fraction_of_median) * median_scale)
+
+    idx = len(scales) - 1
+    masked_any = False
+    while idx >= 0 and np.isfinite(scales[idx]) and (scales[idx] < cutoff):
+        out[idx] = np.nan
+        masked_any = True
+        idx -= 1
+
+    if masked_any and idx >= 0:
+        # Keep only the contiguous trailing low-count region masked.
+        pass
+
+    return out
+
+
 def _plot_run(
     run_name: str,
     timestamps: np.ndarray,
@@ -375,7 +373,7 @@ def _plot_run(
     gross_rate: np.ndarray,
     snr: RunSNR,
     model_type: str,
-    source_intervals: Optional[Sequence[Tuple[float, float]]],
+    source_times: Optional[np.ndarray],
     output_path: Path,
 ) -> None:
     fig, axes = plt.subplots(2, 1, figsize=(13, 8), sharex=True)
@@ -395,13 +393,10 @@ def _plot_run(
     ax1.set_xlabel("Time (s)")
     ax1.grid(True, alpha=0.3)
 
-    if source_intervals:
-        for start_t, end_t in source_intervals:
-            # Bold dotted lines bracketing source-present windows.
-            ax0.axvline(start_t, color="black", linestyle=":", linewidth=2.0, alpha=0.95)
-            ax0.axvline(end_t, color="black", linestyle=":", linewidth=2.0, alpha=0.95)
-            ax1.axvline(start_t, color="black", linestyle=":", linewidth=2.0, alpha=0.95)
-            ax1.axvline(end_t, color="black", linestyle=":", linewidth=2.0, alpha=0.95)
+    if source_times is not None and len(source_times) > 0:
+        for t in source_times:
+            ax0.axvline(float(t), color="black", linestyle=":", linewidth=2.0, alpha=0.95)
+            ax1.axvline(float(t), color="black", linestyle=":", linewidth=2.0, alpha=0.95)
 
     fig.tight_layout()
     fig.savefig(output_path, dpi=170, bbox_inches="tight")
@@ -443,6 +438,20 @@ def parse_args() -> argparse.Namespace:
         "--no-source-lines",
         action="store_true",
         help="Disable source-interval dotted lines even when H5 source labels exist",
+    )
+    parser.add_argument(
+        "--score-type",
+        type=str,
+        default=None,
+        choices=["jsd", "corrected_jsd", "chi2", "normalized_chi2", "reduced_chi2", "combined", "poisson"],
+        help="Override scoring metric (default: use model's loss_type). "
+             "'jsd': raw JSD; "
+             "'corrected_jsd': JSD minus Poisson noise floor (rate-decoupled); "
+             "'chi2': raw Pearson chi-squared; "
+             "'normalized_chi2': chi2/total_counts; "
+             "'reduced_chi2': (chi2 - n_bins)/n_bins (rate-decoupled); "
+             "'combined': JSD + reduced_chi2, flat and count-weighted shape error together; "
+             "'poisson': N-normalized Poisson NLL = KL(target || recon), rate-invariant.",
     )
     return parser.parse_args()
 
@@ -535,7 +544,9 @@ def main() -> None:
                 mask_seed=args.latent_mask_seed,
                 target_count_rates=target_count_rates,
                 normalize_inputs_l1=bool(args.normalize_inputs_l1),
+                score_type=args.score_type,
             )
+            scores = _suppress_low_count_tail_artifact(scores, target_count_rates)
         else:
             scores = _score_run_arad(
                 model_path=args.model_path.resolve(),
@@ -557,19 +568,9 @@ def main() -> None:
 
         out_png = output_dir / f"{args.model_type}_run{row.run_id}_error_and_gross_rate.png"
 
-        source_intervals: Optional[List[Tuple[float, float]]] = None
+        source_times: Optional[np.ndarray] = None
         if not bool(args.no_source_lines):
-            labels = _source_window_labels_from_h5(
-                h5_path=h5_path,
-                run_id=row.run_id,
-                timestamps=np.asarray(ts.timestamps, dtype=np.float64),
-                integration_time=float(integration_time),
-                time_units=str(args.time_units),
-            )
-            source_intervals = _label_intervals(
-                timestamps=np.asarray(ts.timestamps, dtype=np.float64),
-                labels=labels,
-            )
+            source_times = _source_times_from_h5(h5_path=h5_path, run_id=row.run_id)
 
         _plot_run(
             run_name=run_path.name,
@@ -578,7 +579,7 @@ def main() -> None:
             gross_rate=gross_rate,
             snr=row,
             model_type=args.model_type,
-            source_intervals=source_intervals,
+            source_times=source_times,
             output_path=out_png,
         )
 
@@ -591,7 +592,7 @@ def main() -> None:
                 "total_events": row.total_events,
                 "peak_to_median_rate": row.peak_to_median_rate,
                 "std_to_mean_rate": row.std_to_mean_rate,
-                "n_source_intervals": 0 if source_intervals is None else len(source_intervals),
+                "n_source_times": 0 if source_times is None else len(source_times),
                 "plot_path": str(out_png.resolve()),
             }
         )

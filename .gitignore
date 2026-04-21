@@ -100,3 +100,4 @@ CEW_CONTIGUOUS_WINDOWS_FIX.md
 /models
 /wandb
 /eval-results
+/plots

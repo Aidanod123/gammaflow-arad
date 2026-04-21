@@ -2,9 +2,11 @@
 
 Example:
     python examples/train_lstm_temporal_preprocessed.py \
-      --preprocessed-dir preprocessed-data/no-sources-.5-0.1 \
-      --output-model artifacts/lstm_temporal_no_sources_0p5_0p1.pt \
-      --epochs 25 --batch-size 256 --seq-len 20 --seq-stride 1
+      --preprocessed-dir preprocessed-data/no-sources-2.0-1.0 \
+      --output-model models/lstm_softmax_jsd_2.0-1.0.pt \
+      --epochs 40 --batch-size 256 --seq-len 20 --seq-stride 1 \
+      --output-activation softmax --loss-type jsd \
+      --mask-target --early-stopping-patience 8
 """
 
 from __future__ import annotations
@@ -28,7 +30,6 @@ def _maybe_import_wandb(enabled: bool):
         return None
     try:
         import wandb  # type: ignore
-
         return wandb
     except ImportError as exc:
         raise ImportError(
@@ -48,6 +49,8 @@ def _build_wandb_config(args: argparse.Namespace) -> Dict[str, Any]:
         "dropout": args.dropout,
         "mask_target": args.mask_target,
         "loss_type": args.loss_type,
+        "output_activation": args.output_activation,
+        "count_rate_conditioning": args.count_rate_conditioning,
         "learning_rate": args.learning_rate,
         "weight_decay": args.weight_decay,
         "scheduler_factor": args.scheduler_factor,
@@ -76,6 +79,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train LSTMTemporalDetector from preprocessed run tensors"
     )
+
+    # --- Data ---
     parser.add_argument(
         "--preprocessed-dir",
         type=str,
@@ -88,6 +93,8 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Path to save trained detector checkpoint (.pt)",
     )
+
+    # --- Architecture ---
     parser.add_argument("--seq-len", type=int, default=20)
     parser.add_argument("--seq-stride", type=int, default=1)
     parser.add_argument("--latent-dim", type=int, default=64)
@@ -98,84 +105,112 @@ def parse_args() -> argparse.Namespace:
         "--mask-target",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Always mask the target timestep latent embedding (default: true)",
+        help="Mask the target timestep latent embedding to prevent identity shortcut (default: on)",
     )
-    parser.add_argument("--loss-type", type=str, default="jsd", choices=["mse", "jsd", "chi2"])
+    parser.add_argument(
+        "--output-activation",
+        type=str,
+        default="sigmoid",
+        choices=["sigmoid", "softmax"],
+        help="Output activation for the decoder (default: sigmoid)",
+    )
+    parser.add_argument(
+        "--count-rate-conditioning",
+        action="store_true",
+        help="Condition the decoder on log1p(total_counts) to reduce count-rate correlation",
+    )
+
+    # --- Loss ---
+    parser.add_argument("--loss-type", type=str, default="jsd", choices=["mse", "jsd", "chi2", "poisson"])
+
+    # --- Optimiser ---
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
+    parser.add_argument("--grad-clip-norm", type=float, default=1.0)
+
+    # --- LR scheduler ---
     parser.add_argument(
         "--scheduler-factor",
         type=float,
         default=0.5,
-        help="ReduceLROnPlateau multiplicative LR factor in (0, 1)",
+        help="ReduceLROnPlateau multiplicative LR decay factor (default: 0.5)",
     )
     parser.add_argument(
         "--scheduler-patience",
         type=int,
         default=3,
-        help="Epochs with no val-loss improvement before LR decay",
+        help="Epochs with no val-loss improvement before LR decay (default: 3)",
     )
     parser.add_argument(
         "--scheduler-min-lr",
         type=float,
         default=1e-6,
-        help="Minimum LR floor for scheduler",
+        help="Minimum LR floor for scheduler (default: 1e-6)",
     )
     parser.add_argument(
         "--scheduler-threshold",
         type=float,
         default=1e-4,
-        help="Minimum val-loss delta to be treated as LR-scheduler improvement",
+        help="Minimum val-loss delta counted as improvement by scheduler (default: 1e-4)",
     )
     parser.add_argument(
         "--scheduler-cooldown",
         type=int,
         default=1,
-        help="Cooldown epochs after an LR reduction",
+        help="Cooldown epochs after an LR reduction (default: 1)",
     )
+
+    # --- Training loop ---
     parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=40)
     parser.add_argument(
         "--min-epochs",
         type=int,
         default=10,
-        help="Minimum epochs to run before early stopping is allowed",
+        help="Minimum epochs before early stopping is allowed (default: 10)",
     )
     parser.add_argument(
         "--early-stopping-patience",
         type=int,
         default=8,
-        help="Epochs without meaningful val-loss improvement before stop",
+        help="Epochs without meaningful val-loss improvement before stopping (default: 8)",
     )
     parser.add_argument(
         "--early-stopping-min-delta",
         type=float,
         default=1e-4,
-        help="Minimum val-loss improvement to reset early-stopping patience",
+        help="Minimum val-loss improvement to reset early-stopping counter (default: 1e-4)",
     )
-    parser.add_argument("--val-fraction", type=float, default=0.2)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--grad-clip-norm", type=float, default=1.0)
+
+    # --- Latent masking ---
     parser.add_argument(
         "--latent-mask-pct",
         type=float,
         default=0.0,
-        help="Post-encoder latent history timestep masking percentage in [0, 1]",
+        help="Fraction of history latent timesteps to randomly zero during training (default: 0.0)",
     )
     parser.add_argument(
         "--latent-mask-seed",
         type=int,
         default=None,
-        help="Optional random seed for latent timestep masking",
+        help="Optional fixed seed for latent masking RNG (default: uses training seed)",
     )
+
+    # --- Data loading ---
+    parser.add_argument("--val-fraction", type=float, default=0.2)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--cache-size", type=int, default=2)
+
+    # --- Device ---
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument(
         "--require-cuda",
         action="store_true",
         help="Fail if CUDA is unavailable instead of falling back to CPU",
     )
+
+    # --- Logging ---
     parser.add_argument("--quiet", action="store_true", help="Disable per-epoch logging")
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     parser.add_argument("--wandb-project", type=str, default="gammaflow-lstm")
@@ -185,7 +220,7 @@ def parse_args() -> argparse.Namespace:
         "--wandb-tags",
         type=str,
         default="",
-        help="Comma-separated W&B tags (example: lstm,preprocessed,jsd)",
+        help="Comma-separated W&B tags (e.g. 'lstm,jsd,softmax')",
     )
     parser.add_argument("--wandb-group", type=str, default=None)
     parser.add_argument(
@@ -193,8 +228,9 @@ def parse_args() -> argparse.Namespace:
         type=str,
         choices=["online", "offline", "disabled"],
         default="online",
-        help="W&B mode. Use offline for air-gapped runs.",
+        help="W&B mode (default: online; use offline for air-gapped runs)",
     )
+
     return parser.parse_args()
 
 
@@ -247,6 +283,8 @@ def main() -> None:
         dropout=args.dropout,
         mask_target=args.mask_target,
         loss_type=args.loss_type,
+        output_activation=args.output_activation,
+        count_rate_conditioning=args.count_rate_conditioning,
         learning_rate=args.learning_rate,
         weight_decay=args.weight_decay,
         scheduler_factor=args.scheduler_factor,
@@ -259,12 +297,12 @@ def main() -> None:
         min_epochs=args.min_epochs,
         early_stopping_patience=args.early_stopping_patience,
         early_stopping_min_delta=args.early_stopping_min_delta,
+        latent_mask_pct=args.latent_mask_pct,
+        latent_mask_seed=args.latent_mask_seed,
         val_fraction=args.val_fraction,
         seed=args.seed,
         num_workers=args.num_workers,
         grad_clip_norm=args.grad_clip_norm,
-        latent_mask_pct=args.latent_mask_pct,
-        latent_mask_seed=args.latent_mask_seed,
         cache_size=args.cache_size,
         device=args.device,
         require_cuda=args.require_cuda,
@@ -287,6 +325,8 @@ def main() -> None:
             metadata={
                 "best_val_loss": float(result["best_val_loss"]),
                 "loss_type": args.loss_type,
+                "output_activation": args.output_activation,
+                "count_rate_conditioning": args.count_rate_conditioning,
                 "seq_len": args.seq_len,
                 "seq_stride": args.seq_stride,
                 "mask_target": args.mask_target,
@@ -304,9 +344,7 @@ def main() -> None:
             metrics_payload: Dict[str, Any] = json.load(f)
         history = metrics_payload.get("history", {})
         if history:
-            history_table = wandb.Table(
-                columns=["epoch", "train_loss", "val_loss", "lr"]
-            )
+            history_table = wandb.Table(columns=["epoch", "train_loss", "val_loss", "lr"])
             n_epochs = len(history.get("train_loss", []))
             for idx in range(n_epochs):
                 history_table.add_data(
@@ -320,12 +358,12 @@ def main() -> None:
         wandb.finish()
 
     print("Training complete")
-    print(f"Model:   {result['model_path']}")
-    print(f"Metrics: {result['metrics_path']}")
-    print(f"Best val loss: {result['best_val_loss']:.6f}")
-    print(f"Best epoch: {int(result.get('best_epoch', 0))}")
+    print(f"Model:            {result['model_path']}")
+    print(f"Metrics:          {result['metrics_path']}")
+    print(f"Best val loss:    {result['best_val_loss']:.6f}")
+    print(f"Best epoch:       {int(result.get('best_epoch', 0))}")
     print(f"Epochs completed: {int(result.get('epochs_completed', 0))}")
-    print(f"Stopped early: {bool(result.get('stopped_early', False))}")
+    print(f"Stopped early:    {bool(result.get('stopped_early', False))}")
 
 
 if __name__ == "__main__":

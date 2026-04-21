@@ -4,7 +4,12 @@ This pipeline expects each run file (``run*.pt``) to contain a dictionary with a
 least:
 - ``spectra``: tensor/array with shape (n_spectra, n_bins)
 
-The preprocessed datasets in this repository already satisfy this contract.
+Optionally, for physical-domain chi-squared loss and count-rate conditioning:
+- ``count_rates``: tensor/array with shape (n_spectra,) — gross count rate (counts/s)
+- ``live_times``: tensor/array with shape (n_spectra,) — live time per spectrum (s)
+- ``integration_time``: scalar — integration window duration (s)
+
+The preprocessed datasets in this repository satisfy this full contract.
 """
 
 from __future__ import annotations
@@ -15,8 +20,7 @@ from bisect import bisect_right
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
-from typing import Callable
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -47,10 +51,9 @@ class PreprocessedTemporalWindowDataset(Dataset):
 
     Each sample is a tuple ``(window, target, target_scale)`` where:
     - ``window`` has shape ``(seq_len, n_bins)``
-    - ``target`` has shape ``(n_bins,)`` and corresponds to the final spectrum
-      in the window.
-    - ``target_scale`` is a scalar used to de-normalize target/recon for
-      physical-domain chi-squared scoring.
+    - ``target`` has shape ``(n_bins,)`` — final spectrum in the window
+    - ``target_scale`` is a scalar (total counts) for chi2 de-normalization
+      and count-rate decoder conditioning
     """
 
     def __init__(
@@ -101,9 +104,15 @@ class PreprocessedTemporalWindowDataset(Dataset):
 
     @staticmethod
     def _load_run_arrays(path: Path) -> Tuple[np.ndarray, np.ndarray]:
+        """Load spectra and target_scales (total counts) from a run file.
+
+        target_scales = count_rates * live_times when metadata is available,
+        otherwise falls back to the row-sum of the spectra array.
+        """
         obj = torch.load(path, map_location="cpu", weights_only=False)
         if not isinstance(obj, dict) or "spectra" not in obj:
             raise ValueError(f"Expected dict with 'spectra' in {path}")
+
         spectra = obj["spectra"]
         if torch.is_tensor(spectra):
             arr = spectra.detach().cpu().numpy()
@@ -113,13 +122,12 @@ class PreprocessedTemporalWindowDataset(Dataset):
         if arr.ndim != 2:
             raise ValueError(f"spectra in {path} must have shape (n_spectra, n_bins), got {arr.shape}")
 
-        # Preferred chi2 scale is total counts represented by each target spectrum.
-        # This preserves units for Pearson chi-squared regardless of auxiliary
-        # metadata availability.
+        arr = arr.astype(np.float32, copy=False)
+
+        # Default scale: row sums (=1.0 each for L1-normalized spectra).
         scales_arr = np.sum(arr, axis=1)
 
-        # If metadata contains both count_rates and live_times, prefer their
-        # product when valid as an explicit total-count estimate.
+        # Preferred: count_rates * live_times gives true total counts.
         if "count_rates" in obj and "live_times" in obj:
             count_rates = obj["count_rates"]
             live_times = obj["live_times"]
@@ -145,10 +153,7 @@ class PreprocessedTemporalWindowDataset(Dataset):
                 if bool(np.all(finite_positive)):
                     scales_arr = metadata_scales
 
-        return (
-            arr.astype(np.float32, copy=False),
-            np.asarray(scales_arr, dtype=np.float32),
-        )
+        return arr, np.asarray(scales_arr, dtype=np.float32)
 
     def __len__(self) -> int:
         return self._cumulative_windows[-1] if self._cumulative_windows else 0
@@ -298,11 +303,6 @@ def build_dataloaders_from_preprocessed(
     )
 
 
-
-# Loss functions are defined in gammaflow.training.losses and imported as
-# ``get_loss_fn`` at the top of this module.
-
-
 def _sample_history_latent_mask(
     batch_size: int,
     seq_len: int,
@@ -313,24 +313,20 @@ def _sample_history_latent_mask(
 ) -> Optional[torch.Tensor]:
     """Sample a boolean mask over latent timesteps.
 
-    By default only history steps are randomly masked. When
-    ``mask_target_timestep`` is True, the final timestep is always masked to
-    prevent target-embedding shortcut paths.
+    History steps are randomly masked at rate ``latent_mask_pct``.
+    When ``mask_target_timestep`` is True the final timestep is always masked
+    to prevent the encoder from short-circuiting reconstruction.
     """
     if seq_len <= 1:
         return None
-
     history_mask = np.zeros((batch_size, seq_len - 1), dtype=bool)
     if latent_mask_pct > 0.0:
         history_mask = rng.random((batch_size, seq_len - 1)) < float(latent_mask_pct)
 
-    final_col_value = bool(mask_target_timestep)
-    final_col = np.full((batch_size, 1), final_col_value, dtype=bool)
+    final_col = np.full((batch_size, 1), bool(mask_target_timestep), dtype=bool)
     full_mask = np.concatenate([history_mask, final_col], axis=1)
-
     if not bool(full_mask.any()):
         return None
-
     return torch.from_numpy(full_mask).to(device=device)
 
 
@@ -341,29 +337,30 @@ def train_lstm_temporal_from_preprocessed(
     seq_stride: int = 1,
     latent_dim: int = 64,
     lstm_hidden_dim: int = 128,
-    lstm_layers: int = 2,
+    lstm_layers: int = 1,
     dropout: float = 0.2,
     mask_target: bool = True,
-    use_attention: Optional[bool] = None,
     loss_type: str = "jsd",
+    output_activation: str = "sigmoid",
+    count_rate_conditioning: bool = False,
     learning_rate: float = 1e-3,
     weight_decay: float = 1e-5,
-    batch_size: int = 128,
-    epochs: int = 20,
-    min_epochs: int = 10,
-    val_fraction: float = 0.2,
-    seed: int = 42,
-    num_workers: int = 0,
-    grad_clip_norm: float = 1.0,
-    latent_mask_pct: float = 0.0,
-    latent_mask_seed: Optional[int] = None,
     scheduler_factor: float = 0.5,
     scheduler_patience: int = 3,
     scheduler_min_lr: float = 1e-6,
     scheduler_threshold: float = 1e-4,
     scheduler_cooldown: int = 1,
+    batch_size: int = 128,
+    epochs: int = 20,
+    min_epochs: int = 10,
     early_stopping_patience: int = 8,
     early_stopping_min_delta: float = 1e-4,
+    latent_mask_pct: float = 0.0,
+    latent_mask_seed: Optional[int] = None,
+    val_fraction: float = 0.2,
+    seed: int = 42,
+    num_workers: int = 0,
+    grad_clip_norm: float = 1.0,
     cache_size: int = 2,
     device: Optional[str] = None,
     require_cuda: bool = False,
@@ -372,18 +369,11 @@ def train_lstm_temporal_from_preprocessed(
 ) -> Dict[str, object]:
     """Train LSTMTemporalDetector on preprocessed run tensors.
 
-    Returns a dictionary containing trained detector, training history, and paths.
+    Returns a dictionary with trained detector, history, paths, and stop metadata.
     """
-    torch.manual_seed(seed)
-
+    # --- Input validation ---
     if not (0.0 <= float(latent_mask_pct) <= 1.0):
         raise ValueError(f"latent_mask_pct must be in [0, 1], got {latent_mask_pct}")
-    if use_attention is not None and bool(use_attention):
-        # Backward compatibility with older call sites that used attention.
-        # Attention is removed; preserve closest legacy behavior by ensuring
-        # the target timestep is masked.
-        mask_target = True
-    mask_target = bool(mask_target)
     if int(epochs) < 1:
         raise ValueError(f"epochs must be >= 1, got {epochs}")
     if int(min_epochs) < 1:
@@ -391,33 +381,22 @@ def train_lstm_temporal_from_preprocessed(
     if int(min_epochs) > int(epochs):
         raise ValueError(f"min_epochs ({min_epochs}) cannot exceed epochs ({epochs})")
     if not (0.0 < float(scheduler_factor) < 1.0):
-        raise ValueError(
-            f"scheduler_factor must be in (0, 1), got {scheduler_factor}"
-        )
+        raise ValueError(f"scheduler_factor must be in (0, 1), got {scheduler_factor}")
     if int(scheduler_patience) < 0:
-        raise ValueError(
-            f"scheduler_patience must be >= 0, got {scheduler_patience}"
-        )
+        raise ValueError(f"scheduler_patience must be >= 0, got {scheduler_patience}")
     if float(scheduler_min_lr) < 0.0:
         raise ValueError(f"scheduler_min_lr must be >= 0, got {scheduler_min_lr}")
     if float(scheduler_threshold) < 0.0:
-        raise ValueError(
-            f"scheduler_threshold must be >= 0, got {scheduler_threshold}"
-        )
+        raise ValueError(f"scheduler_threshold must be >= 0, got {scheduler_threshold}")
     if int(scheduler_cooldown) < 0:
-        raise ValueError(
-            f"scheduler_cooldown must be >= 0, got {scheduler_cooldown}"
-        )
+        raise ValueError(f"scheduler_cooldown must be >= 0, got {scheduler_cooldown}")
     if int(early_stopping_patience) < 1:
-        raise ValueError(
-            "early_stopping_patience must be >= 1, "
-            f"got {early_stopping_patience}"
-        )
+        raise ValueError(f"early_stopping_patience must be >= 1, got {early_stopping_patience}")
     if float(early_stopping_min_delta) < 0.0:
-        raise ValueError(
-            "early_stopping_min_delta must be >= 0, "
-            f"got {early_stopping_min_delta}"
-        )
+        raise ValueError(f"early_stopping_min_delta must be >= 0, got {early_stopping_min_delta}")
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
     bundles = build_dataloaders_from_preprocessed(
         preprocessed_dir=preprocessed_dir,
@@ -449,8 +428,10 @@ def train_lstm_temporal_from_preprocessed(
         lstm_hidden_dim=lstm_hidden_dim,
         lstm_layers=lstm_layers,
         dropout=dropout,
-        mask_target=mask_target,
+        mask_target=bool(mask_target),
         loss_type=loss_type,
+        output_activation=output_activation,
+        count_rate_conditioning=count_rate_conditioning,
         threshold=None,
         device=device,
         verbose=verbose,
@@ -467,8 +448,6 @@ def train_lstm_temporal_from_preprocessed(
         print(f"Training on GPU: {gpu_name} ({detector.device})")
 
     model = detector.model_
-    mask_rng_seed = seed if latent_mask_seed is None else int(latent_mask_seed)
-    train_mask_rng = np.random.default_rng(mask_rng_seed)
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -486,6 +465,9 @@ def train_lstm_temporal_from_preprocessed(
     )
     loss_fn = get_loss_fn(loss_type)
 
+    mask_rng_seed = seed if latent_mask_seed is None else int(latent_mask_seed)
+    train_mask_rng = np.random.default_rng(mask_rng_seed)
+
     history: Dict[str, List[float]] = {
         "train_loss": [],
         "val_loss": [],
@@ -493,8 +475,8 @@ def train_lstm_temporal_from_preprocessed(
     }
 
     best_val = float("inf")
-    best_epoch = 0
     best_state = None
+    best_epoch = 0
     epochs_without_improvement = 0
     stopped_early = False
     stop_reason = "completed_all_epochs"
@@ -510,17 +492,20 @@ def train_lstm_temporal_from_preprocessed(
             windows = windows.to(detector.device)
             targets = targets.to(detector.device)
             target_scales = target_scales.to(detector.device)
+
             latent_mask = _sample_history_latent_mask(
                 batch_size=int(windows.shape[0]),
                 seq_len=int(windows.shape[1]),
                 latent_mask_pct=float(latent_mask_pct),
                 rng=train_mask_rng,
                 device=detector.device,
-                mask_target_timestep=mask_target,
+                mask_target_timestep=bool(mask_target),
             )
 
+            cr = target_scales if count_rate_conditioning else None
+
             optimizer.zero_grad(set_to_none=True)
-            recon = model(windows, latent_timestep_mask=latent_mask)
+            recon = model(windows, latent_timestep_mask=latent_mask, count_rate=cr)
             if str(loss_type).lower() == "chi2":
                 loss = loss_fn(targets, recon, target_scales=target_scales)
             else:
@@ -535,26 +520,28 @@ def train_lstm_temporal_from_preprocessed(
 
         train_loss = train_loss_sum / max(train_items, 1)
 
+        # Reset RNG with same seed each epoch so val masking is reproducible.
+        val_mask_rng = np.random.default_rng(mask_rng_seed)
         model.eval()
         val_loss_sum = 0.0
         val_items = 0
-        # Reset RNG with the same seed each epoch so validation masking is
-        # identical across epochs.
-        val_mask_rng = np.random.default_rng(mask_rng_seed)
         with torch.no_grad():
             for windows, targets, target_scales in bundles.val_loader:
                 windows = windows.to(detector.device)
                 targets = targets.to(detector.device)
                 target_scales = target_scales.to(detector.device)
+
                 latent_mask = _sample_history_latent_mask(
                     batch_size=int(windows.shape[0]),
                     seq_len=int(windows.shape[1]),
                     latent_mask_pct=float(latent_mask_pct),
                     rng=val_mask_rng,
                     device=detector.device,
-                    mask_target_timestep=mask_target,
+                    mask_target_timestep=bool(mask_target),
                 )
-                recon = model(windows, latent_timestep_mask=latent_mask)
+
+                cr = target_scales if count_rate_conditioning else None
+                recon = model(windows, latent_timestep_mask=latent_mask, count_rate=cr)
                 if str(loss_type).lower() == "chi2":
                     loss = loss_fn(targets, recon, target_scales=target_scales)
                 else:
@@ -579,8 +566,8 @@ def train_lstm_temporal_from_preprocessed(
 
         if val_loss < (best_val - float(early_stopping_min_delta)):
             best_val = val_loss
-            best_epoch = epoch
             best_state = copy.deepcopy(model.state_dict())
+            best_epoch = epoch
             epochs_without_improvement = 0
         else:
             epochs_without_improvement += 1
@@ -604,14 +591,12 @@ def train_lstm_temporal_from_preprocessed(
         ):
             stopped_early = True
             stop_reason = (
-                "early_stopping_no_improvement_for_"
-                f"{int(early_stopping_patience)}_epochs"
+                f"early_stopping_no_improvement_for_{int(early_stopping_patience)}_epochs"
             )
             if verbose:
                 print(
-                    "Early stopping triggered at epoch "
-                    f"{epoch:03d} (best_epoch={best_epoch:03d}, "
-                    f"best_val_loss={best_val:.6f})"
+                    f"Early stopping at epoch {epoch:03d} "
+                    f"(best_epoch={best_epoch:03d}, best_val_loss={best_val:.6f})"
                 )
             break
 
@@ -632,35 +617,36 @@ def train_lstm_temporal_from_preprocessed(
         "lstm_hidden_dim": lstm_hidden_dim,
         "lstm_layers": lstm_layers,
         "dropout": dropout,
-        "mask_target": mask_target,
-        "use_attention": False,
+        "mask_target": bool(mask_target),
         "loss_type": loss_type,
+        "output_activation": output_activation,
+        "count_rate_conditioning": count_rate_conditioning,
         "learning_rate": learning_rate,
         "weight_decay": weight_decay,
-        "batch_size": batch_size,
-        "epochs": epochs,
-        "min_epochs": min_epochs,
-        "val_fraction": val_fraction,
-        "seed": seed,
-        "latent_mask_pct": latent_mask_pct,
-        "latent_mask_seed": latent_mask_seed,
         "scheduler_factor": scheduler_factor,
         "scheduler_patience": scheduler_patience,
         "scheduler_min_lr": scheduler_min_lr,
         "scheduler_threshold": scheduler_threshold,
         "scheduler_cooldown": scheduler_cooldown,
+        "batch_size": batch_size,
+        "epochs": epochs,
+        "min_epochs": min_epochs,
         "early_stopping_patience": early_stopping_patience,
         "early_stopping_min_delta": early_stopping_min_delta,
-        "epochs_completed": int(epochs_completed),
-        "stopped_early": bool(stopped_early),
-        "stop_reason": stop_reason,
-        "best_epoch": int(best_epoch),
+        "latent_mask_pct": latent_mask_pct,
+        "latent_mask_seed": latent_mask_seed,
+        "val_fraction": val_fraction,
+        "seed": seed,
         "device": str(detector.device),
         "require_cuda": require_cuda,
         "n_bins": bundles.n_bins,
         "train_runs": [p.name for p in bundles.train_run_files],
         "val_runs": [p.name for p in bundles.val_run_files],
         "best_val_loss": best_val,
+        "best_epoch": int(best_epoch),
+        "epochs_completed": int(epochs_completed),
+        "stopped_early": bool(stopped_early),
+        "stop_reason": stop_reason,
         "history": history,
     }
 

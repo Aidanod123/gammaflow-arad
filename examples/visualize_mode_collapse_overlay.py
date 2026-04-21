@@ -1,8 +1,7 @@
 """Overlay random reconstructions to inspect possible mode collapse.
 
-Creates two plots for one run file using the same sampled spectrum indices:
+Creates one plot for one run file using the same sampled spectrum indices:
 1) LSTM temporal reconstructions overlaid
-2) ARAD reconstructions overlaid
 """
 
 from __future__ import annotations
@@ -22,7 +21,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from gammaflow import SpectralTimeSeries, Spectrum
-from gammaflow.algorithms.arad import ARADDetector
 from gammaflow.algorithms.lstm_temporal import LSTMTemporalDetector
 
 
@@ -192,9 +190,8 @@ def _overlay_plot(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Overlay random LSTM/ARAD reconstructions")
+    parser = argparse.ArgumentParser(description="Overlay random LSTM reconstructions")
     parser.add_argument("--lstm-model-path", type=Path, required=True)
-    parser.add_argument("--arad-model-path", type=Path, required=True)
     parser.add_argument("--run-file", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--num-spectra", type=int, default=10)
@@ -242,9 +239,6 @@ def main() -> None:
     lstm = LSTMTemporalDetector(device=args.device, verbose=False)
     lstm.load(str(args.lstm_model_path.resolve()))
 
-    arad = ARADDetector(device=args.device, verbose=False)
-    arad.load(str(args.arad_model_path.resolve()))
-
     valid_lstm_indices = np.where(
         np.isfinite(lstm.score_time_series(ts, target_count_rates=target_count_rates))
     )[0]
@@ -253,25 +247,18 @@ def main() -> None:
         raise RuntimeError("No valid indices available for LSTM reconstruction")
 
     lstm_curves: List[np.ndarray] = []
-    arad_curves: List[np.ndarray] = []
 
     for idx in indices:
         lstm_recon = _reconstruct_lstm_at_index(lstm, counts, idx, target_count_rates)
         if lstm_recon is None:
             continue
 
-        spec = ts[idx]
-        arad_count_rate = arad.reconstruct(spec)
-        arad_recon = arad_count_rate * _spectrum_time(spec)
-
         if args.normalize:
             lstm_curves.append(_normalize_curve(lstm_recon))
-            arad_curves.append(_normalize_curve(arad_recon))
         else:
             lstm_curves.append(np.asarray(lstm_recon, dtype=float))
-            arad_curves.append(np.asarray(arad_recon, dtype=float))
 
-    if not lstm_curves or not arad_curves:
+    if not lstm_curves:
         raise RuntimeError("Failed to build reconstruction overlays")
 
     used_indices = indices[: len(lstm_curves)]
@@ -280,7 +267,6 @@ def main() -> None:
 
     suffix = "normalized" if args.normalize else "raw"
     lstm_out = args.output_dir / f"lstm_overlay_{suffix}.png"
-    arad_out = args.output_dir / f"arad_overlay_{suffix}.png"
 
     title_tail = "(normalized)" if args.normalize else "(raw scale)"
     _overlay_plot(
@@ -290,31 +276,21 @@ def main() -> None:
         out_path=lstm_out,
         log_y=bool(args.log_y),
     )
-    _overlay_plot(
-        curves=arad_curves,
-        indices=used_indices,
-        title=f"ARAD Reconstructions Overlay - {len(used_indices)} Random Spectra {title_tail}",
-        out_path=arad_out,
-        log_y=bool(args.log_y),
-    )
 
     summary: Dict[str, object] = {
         "run_file": str(args.run_file.resolve()),
         "lstm_model_path": str(args.lstm_model_path.resolve()),
-        "arad_model_path": str(args.arad_model_path.resolve()),
         "num_requested": int(args.num_spectra),
         "num_used": int(len(used_indices)),
         "indices": used_indices,
         "normalize": bool(args.normalize),
         "log_y": bool(args.log_y),
         "lstm_plot": str(lstm_out.resolve()),
-        "arad_plot": str(arad_out.resolve()),
     }
     summary_path = args.output_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2))
 
     print(f"Saved LSTM overlay: {lstm_out}")
-    print(f"Saved ARAD overlay: {arad_out}")
     print(f"Saved summary: {summary_path}")
 
 

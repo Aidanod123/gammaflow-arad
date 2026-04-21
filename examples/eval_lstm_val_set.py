@@ -234,13 +234,46 @@ def _score_run(
     target_count_rates: Optional[np.ndarray],
     latent_mask_pct: float,
     mask_seed: Optional[int],
+    score_type: Optional[str] = None,
 ) -> np.ndarray:
-    return detector.score_time_series(
+    scores = detector.score_time_series(
         ts,
         target_count_rates=target_count_rates,
         latent_mask_pct=float(latent_mask_pct),
         mask_seed=mask_seed,
+        score_type=score_type,
     )
+    return _suppress_low_count_tail_artifact(scores, target_count_rates)
+
+
+def _suppress_low_count_tail_artifact(
+    scores: np.ndarray,
+    target_scales: Optional[np.ndarray],
+    min_fraction_of_median: float = 0.05,
+    min_scale_floor: float = 50.0,
+) -> np.ndarray:
+    """Mask trailing low-count windows that can create end-of-run score spikes."""
+    if target_scales is None:
+        return np.asarray(scores, dtype=np.float64)
+
+    out = np.asarray(scores, dtype=np.float64).copy()
+    scales = np.asarray(target_scales, dtype=np.float64)
+    if out.shape != scales.shape:
+        return out
+
+    finite_positive = scales[np.isfinite(scales) & (scales > 0.0)]
+    if finite_positive.size == 0:
+        return out
+
+    median_scale = float(np.median(finite_positive))
+    cutoff = max(float(min_scale_floor), float(min_fraction_of_median) * median_scale)
+
+    idx = len(scales) - 1
+    while idx >= 0 and np.isfinite(scales[idx]) and (scales[idx] < cutoff):
+        out[idx] = np.nan
+        idx -= 1
+
+    return out
 
 
 def _calibrate_threshold(
@@ -249,6 +282,7 @@ def _calibrate_threshold(
     alarms_per_hour: float,
     latent_mask_pct: float,
     mask_seed: Optional[int],
+    score_type: Optional[str] = None,
 ) -> float:
     """Calibrate threshold to target FAR using clean background runs.
 
@@ -277,7 +311,9 @@ def _calibrate_threshold(
             target_count_rates=target_count_rates,
             latent_mask_pct=float(latent_mask_pct),
             mask_seed=mask_seed,
+            score_type=score_type,
         )
+        scores = _suppress_low_count_tail_artifact(scores, target_count_rates)
 
         timestamps = np.asarray(ts.timestamps, dtype=np.float64)
         real_times = np.asarray(ts.real_times, dtype=np.float64)
@@ -443,6 +479,11 @@ def parse_args() -> argparse.Namespace:
                                  help="Calibrate threshold to this FAR from --calibration-dir")
     parser.add_argument("--calibration-dir", type=Path, default=None,
                         help="Clean-background run*.pt dir for FAR threshold calibration")
+    parser.add_argument("--score-type", type=str, default=None,
+                        choices=["jsd", "chi2", "normalized_chi2"],
+                        help="Override scoring metric (default: use model's loss_type). "
+                             "'jsd': rate-invariant JSD; "
+                             "'normalized_chi2': chi2/total_counts, rate-invariant shape error.")
     return parser.parse_args()
 
 
@@ -508,6 +549,7 @@ def main() -> None:
             alarms_per_hour=float(args.alarms_per_hour),
             latent_mask_pct=float(args.latent_mask_pct),
             mask_seed=args.latent_mask_seed,
+            score_type=args.score_type,
         )
         print(f"Calibrated threshold: {threshold:.6g}")
     else:
@@ -533,6 +575,7 @@ def main() -> None:
             target_count_rates=target_count_rates,
             latent_mask_pct=float(args.latent_mask_pct),
             mask_seed=args.latent_mask_seed,
+            score_type=args.score_type,
         )
 
         finite_scores = scores[np.isfinite(scores)]
@@ -620,6 +663,7 @@ def main() -> None:
         "h5_path": str(args.h5_path.resolve()) if args.h5_path else None,
         "threshold": detector.threshold,
         "loss_type": detector.loss_type,
+        "score_type": args.score_type,
         "seq_len": detector.seq_len,
         "seq_stride": detector.seq_stride,
         "use_attention": detector.use_attention,

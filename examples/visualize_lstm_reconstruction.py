@@ -130,7 +130,7 @@ def _score_and_reconstruct_at_index(
         masked_index_set=None,
         latent_mask_pct=float(latent_mask_pct),
         rng=rng,
-        mask_target_timestep=bool(detector.use_attention),
+        mask_target_timestep=bool(detector.mask_target),
     )
 
     with torch.no_grad():
@@ -140,7 +140,6 @@ def _score_and_reconstruct_at_index(
         if latent_mask_np is not None:
             latent_mask_tensor = torch.from_numpy(latent_mask_np).unsqueeze(0).to(detector.device)
 
-        recon_raw = detector.model_(window_tensor, latent_timestep_mask=latent_mask_tensor)
         scale_tensor = None
         if target_count_rates is not None:
             scale_tensor = torch.tensor(
@@ -148,6 +147,12 @@ def _score_and_reconstruct_at_index(
                 device=detector.device,
                 dtype=target_tensor.dtype,
             )
+        cr_tensor = scale_tensor if detector.count_rate_conditioning else None
+        recon_raw = detector.model_(
+            window_tensor,
+            latent_timestep_mask=latent_mask_tensor,
+            count_rate=cr_tensor,
+        )
         score_t = detector._score_batch(target_tensor, recon_raw, target_scales=scale_tensor)
 
     recon_raw_np = recon_raw.detach().cpu().numpy().squeeze(0)

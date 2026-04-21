@@ -516,6 +516,36 @@ def _safe_stats(values: np.ndarray) -> Dict[str, float]:
     }
 
 
+def _suppress_low_count_tail_artifact(
+    scores: np.ndarray,
+    target_scales: Optional[np.ndarray],
+    min_fraction_of_median: float = 0.05,
+    min_scale_floor: float = 50.0,
+) -> np.ndarray:
+    """Mask trailing low-count windows that can create end-of-run score spikes."""
+    if target_scales is None:
+        return np.asarray(scores, dtype=np.float64)
+
+    out = np.asarray(scores, dtype=np.float64).copy()
+    scales = np.asarray(target_scales, dtype=np.float64)
+    if out.shape != scales.shape:
+        return out
+
+    finite_positive = scales[np.isfinite(scales) & (scales > 0.0)]
+    if finite_positive.size == 0:
+        return out
+
+    median_scale = float(np.median(finite_positive))
+    cutoff = max(float(min_scale_floor), float(min_fraction_of_median) * median_scale)
+
+    idx = len(scales) - 1
+    while idx >= 0 and np.isfinite(scales[idx]) and (scales[idx] < cutoff):
+        out[idx] = np.nan
+        idx -= 1
+
+    return out
+
+
 def _time_unit_scale(units: str) -> float:
     u = units.strip().lower()
     if u == "us":
@@ -947,6 +977,7 @@ def evaluate_model(
             mask_seed=run_mask_seed,
             mask_alarm_feedback=bool(mask_alarm_feedback),
         )
+        scores = _suppress_low_count_tail_artifact(scores, target_scales)
         alarms = detector.get_alarm_summary().get("alarm_events", [])
 
         finite_scores = scores[np.isfinite(scores)]
